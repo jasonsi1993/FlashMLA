@@ -164,19 +164,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
     if (sched_meta.begin_req_idx >= params.b) return;
 
-#ifdef FLASH_MLA_SM120_MODE
-    // SM120: Q loaded per pass. Initial pass loads Q[:, 0:QK_TILES_PER_PASS*64].
-    if (warp_idx == 0 && elect_one_sync()) {
-        static constexpr int PASS_DIM = QK_TILES_PER_PASS * 64;
-        Tensor gQ = flat_divide(
-            tma_params.tma_Q.get_tma_tensor(tma_params.shape_Q)(_, _, s_q_idx, sched_meta.begin_req_idx),
-            Tile<Int<BLOCK_M>, Int<HEAD_DIM_K>>{}
-        )(_, _, head_block_idx, _0{});
-        Tensor gQ_pass = local_tile(gQ, Shape<Int<BLOCK_M>, Int<PASS_DIM>>{}, make_coord(_0{}, _0{}));
-        launch_tma_copy(tma_params.tma_Q, gQ_pass, sQ, plan.bar_q, TMA::CacheHintSm90::EVICT_FIRST);
-        plan.bar_q.arrive_and_expect_tx(BLOCK_M*PASS_DIM*sizeof(bf16));
-    }
-#else
+#ifndef FLASH_MLA_SM120_MODE
     if (warp_idx == 0 && elect_one_sync()) {
         Tensor gQ = flat_divide(
             tma_params.tma_Q.get_tma_tensor(tma_params.shape_Q)(_, _, s_q_idx, sched_meta.begin_req_idx),
@@ -239,6 +227,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             }
         }
 
+#ifdef FLASH_MLA_SM120_MODE
+        int bar_phase_q = 0;
+#endif
         #pragma unroll 1
         for (int batch_idx = sched_meta.begin_req_idx; batch_idx <= sched_meta.end_req_idx; ++batch_idx) {
             MainloopArgs args = get_cur_req_info(batch_idx);
@@ -247,8 +238,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             rM[0] = rM[1] = MAX_INIT_VAL;
             cute::fill(rO, 0.);
 
+#ifndef FLASH_MLA_SM120_MODE
             // Wait for Q
             plan.bar_q.wait((sched_meta.begin_req_idx-batch_idx)&1);
+#endif
 
             CUTE_NO_UNROLL
             for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; block_idx++) {
@@ -263,26 +256,53 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 }
 
 #ifdef FLASH_MLA_SM120_MODE
-                // SM120: QK in passes. Each pass processes QK_TILES_PER_PASS tiles.
-                // rP accumulates across passes (gemm<true, -1> accumulates).
+                // SM120: Q/K are staged in smaller shared-memory buffers. Reload the
+                // matching Q slice for every QK pass before consuming the freshly
+                // produced K pass; otherwise pass 1 would reuse Q[:, 0:320] against
+                // K[:, 320:] and corrupt the accumulated QK scores.
                 {
-                    auto thr_sQ = thr_mma_QK.partition_fragment_A(sQ);
-                    auto thr_sK = thr_mma_QK.partition_fragment_B(sK);
-                    // First pass: K data already loaded and signaled by producer
-                    gemm<true, -1>(tiled_mma_QK, thr_sQ, thr_sK, rP);
-                    // For additional passes: wait for producer, GMMA, signal back
+                    static constexpr int PASS_DIM = QK_TILES_PER_PASS * 64;
+                    static constexpr int LAST_PASS_DIM = HEAD_DIM_K - (NUM_QK_PASSES - 1) * PASS_DIM;
+                    static_assert(NUM_QK_PASSES == 2, "SM120 Q pass reload currently assumes two QK passes");
                     CUTE_NO_UNROLL
-                    for (int qk_pass = 1; qk_pass < NUM_QK_PASSES; qk_pass++) {
-                        // Signal producer we're done with this pass's K buffer
-                        plan.bar_k_avail[buf_idx].arrive();
-                        bar_phase_k ^= 1 << buf_idx;
-                        // Wait for producer to load next pass K data
-                        plan.bar_k_local_ready[buf_idx].wait(bar_phase_k >> buf_idx & 1);
-                        if constexpr (CLUSTER_SIZE == 2) {
-                            plan.bar_k_remote_ready[buf_idx].wait(bar_phase_k >> buf_idx & 1);
+                    for (int qk_pass = 0; qk_pass < NUM_QK_PASSES; qk_pass++) {
+                        if (threadIdx.x/32 == 0 && elect_one_sync()) {
+                            Tensor gQ = flat_divide(
+                                tma_params.tma_Q.get_tma_tensor(tma_params.shape_Q)(_, _, s_q_idx, batch_idx),
+                                Tile<Int<BLOCK_M>, Int<HEAD_DIM_K>>{}
+                            )(_, _, head_block_idx, _0{});
+                            if (qk_pass == 0) {
+                                Tensor gQ_pass = local_tile(gQ, Shape<Int<BLOCK_M>, Int<PASS_DIM>>{}, make_coord(_0{}, _0{}));
+                                launch_tma_copy(tma_params.tma_Q, gQ_pass, sQ, plan.bar_q, TMA::CacheHintSm90::EVICT_FIRST);
+                                plan.bar_q.arrive_and_expect_tx(BLOCK_M*PASS_DIM*sizeof(bf16));
+                            } else {
+                                Tensor gQ_tail = domain_offset(make_coord(_0{}, Int<PASS_DIM>{}), gQ);
+                                Tensor gQ_pass = local_tile(gQ_tail, Shape<Int<BLOCK_M>, Int<LAST_PASS_DIM>>{}, make_coord(_0{}, _0{}));
+                                Tensor sQ_pass = local_tile(sQ, Shape<Int<BLOCK_M>, Int<LAST_PASS_DIM>>{}, make_coord(_0{}, _0{}));
+                                launch_tma_copy(tma_params.tma_Q, gQ_pass, sQ_pass, plan.bar_q, TMA::CacheHintSm90::EVICT_FIRST);
+                                plan.bar_q.arrive_and_expect_tx(BLOCK_M*LAST_PASS_DIM*sizeof(bf16));
+                            }
                         }
-                        // GMMA QK for this pass (accumulates into rP)
-                        gemm<true, -1>(tiled_mma_QK, thr_sQ, thr_sK, rP);
+                        plan.bar_q.wait(bar_phase_q);
+                        bar_phase_q ^= 1;
+
+                        if (qk_pass != 0) {
+                            // Signal producer we're done with the previous pass's K buffer.
+                            plan.bar_k_avail[buf_idx].arrive();
+                            bar_phase_k ^= 1 << buf_idx;
+                            // Wait for producer to load the next pass K data.
+                            plan.bar_k_local_ready[buf_idx].wait(bar_phase_k >> buf_idx & 1);
+                            if constexpr (CLUSTER_SIZE == 2) {
+                                plan.bar_k_remote_ready[buf_idx].wait(bar_phase_k >> buf_idx & 1);
+                            }
+                        }
+
+                        gemm<true, -1>(
+                            tiled_mma_QK,
+                            thr_mma_QK.partition_fragment_A(sQ),
+                            thr_mma_QK.partition_fragment_B(sK),
+                            rP
+                        );
                     }
                 }
 #else
@@ -329,6 +349,12 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 }
             }
 
+#ifdef FLASH_MLA_SM120_MODE
+            if (threadIdx.x/32 == 0 && elect_one_sync() && batch_idx == sched_meta.end_req_idx) {
+                // This kernel is followed by the combine kernel, so we signal PDL here.
+                cudaTriggerProgrammaticLaunchCompletion();
+            }
+#else
             // Copy the next q
             if (threadIdx.x/32 == 0 && elect_one_sync()) {
                 if (batch_idx != sched_meta.end_req_idx) {
@@ -343,6 +369,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     cudaTriggerProgrammaticLaunchCompletion();
                 }
             }
+#endif
 
             // Synchronize L and M across warpgroups
             rL[0] += __shfl_xor_sync(0xffffffff, rL[0], 1);
@@ -626,9 +653,11 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         plan.bar_k_avail[buf_idx].wait((bar_phase_k>>buf_idx&1)^1);
                     }
                     
+#ifndef FLASH_MLA_SM120_MODE
                     if (CLUSTER_SIZE == 2 && round == 0 && idx_in_warpgroup == 0) {
                         plan.bar_k_remote_ready[buf_idx].arrive_and_expect_tx((TOPK_BLOCK_SIZE/2)*(HEAD_DIM_NOPE+HEAD_DIM_ROPE)*sizeof(bf16));
                     }
+#endif
 
                     // Collectively copy from global memory and dequant
                     // For more detail about the layout of K/V, please refer to comments in flash_mla_interface.py
@@ -649,6 +678,13 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         int pass_nope_tiles = (pass_start_tile < TOTAL_NOPE_TILES)
                             ? min(QK_TILES_PER_PASS, TOTAL_NOPE_TILES - pass_start_tile) : 0;
                         int remaining_slots = QK_TILES_PER_PASS - pass_nope_tiles;
+                        int pass_k_dim = pass_nope_tiles * 64;
+                        if (pass_start_tile <= TOTAL_NOPE_TILES && pass_start_tile + QK_TILES_PER_PASS > TOTAL_NOPE_TILES && remaining_slots > 0) {
+                            pass_k_dim += HEAD_DIM_ROPE;
+                        }
+                        if (CLUSTER_SIZE == 2 && round == 0 && idx_in_warpgroup == 0) {
+                            plan.bar_k_remote_ready[buf_idx].arrive_and_expect_tx((TOPK_BLOCK_SIZE/2)*pass_k_dim*sizeof(bf16));
+                        }
 
                         // Load nope tiles for this pass
                         CUTE_UNROLL
@@ -671,8 +707,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             dequant_and_save_bf16x8(cur_fp8x16.hi, 8);
                         }
 
-                        // Load rope tiles in the pass that follows all nope tiles
-                        if (pass_nope_tiles < QK_TILES_PER_PASS && remaining_slots > 0) {
+                        // Load rope only in the final logical K-dim pass, immediately after all NoPE tiles.
+                        if (pass_start_tile <= TOTAL_NOPE_TILES && pass_start_tile + QK_TILES_PER_PASS > TOTAL_NOPE_TILES && remaining_slots > 0) {
                             bf16* gK_rope;
                             if constexpr (MODEL_TYPE == ModelType::V32) {
                                 gK_rope = (bf16*)(gK_base+HEAD_DIM_NOPE+NUM_SCALES*sizeof(float)) + (lane_idx/8)*8;
@@ -700,7 +736,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             }
 
                             // Zero-fill remaining tiles in this pass buffer
-                            int total_valid_tiles = pass_nope_tiles + TOTAL_ROPE_TILES * 32 / 64;
+                            int total_valid_tiles = pass_nope_tiles + HEAD_DIM_ROPE / 64;
                             for (int z = total_valid_tiles; z < QK_TILES_PER_PASS; z++) {
                                 int smem_offset = z * 64 * TOPK_BLOCK_SIZE;
                                 #pragma unroll
