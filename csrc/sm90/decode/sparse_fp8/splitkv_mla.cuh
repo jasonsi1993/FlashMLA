@@ -20,11 +20,13 @@ using namespace cute;
 // SM120 uses a different SharedMemoryPlan layout (anonymous union, no .u nesting)
 #ifdef FLASH_MLA_SM120_MODE
 #define PLAN_K_DATA(buf) plan.k.data()
+#define PLAN_V_DATA(buf) plan.q.data()
 #define PLAN_OBUF_DATA() plan.oBuf.data()
 #define PLAN_OACCUMBUF_DATA() plan.oAccumBuf.data()
 #define PLAN_K_TYPE SmemLayoutKPass
 #else
 #define PLAN_K_DATA(buf) plan.u.k[buf].data()
+#define PLAN_V_DATA(buf) PLAN_K_DATA(buf)
 #define PLAN_OBUF_DATA() plan.u.oBuf.data()
 #define PLAN_OACCUMBUF_DATA() plan.u.oAccumBuf.data()
 #define PLAN_K_TYPE SmemLayoutK
@@ -142,12 +144,21 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 plan.bar_k_local_ready[i].init(128);
                 plan.bar_k_remote_ready[i].init(1);
                 plan.bar_k_avail[i].init(4);
+#ifdef FLASH_MLA_SM120_MODE
+                plan.bar_qk_done[i].init(128);
+                plan.bar_v_local_ready[i].init(128);
+                plan.bar_v_remote_ready[i].init(1);
+#endif
             }
         } else {
             CUTE_UNROLL
             for (int i = 0; i < NUM_K_BUFS; ++i) {
                 plan.bar_k_local_ready[i].init(128);
                 plan.bar_k_avail[i].init(256);
+#ifdef FLASH_MLA_SM120_MODE
+                plan.bar_qk_done[i].init(128);
+                plan.bar_v_local_ready[i].init(128);
+#endif
             }
         }
         cutlass::arch::fence_barrier_init();
@@ -247,7 +258,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; block_idx++) {
                 int buf_idx = (block_idx-args.start_block_idx) % NUM_K_BUFS;
                 Tensor sK = make_tensor(make_smem_ptr(PLAN_K_DATA(buf_idx)), PLAN_K_TYPE{});
-                Tensor sV = make_tensor(make_smem_ptr(PLAN_K_DATA(buf_idx)), SmemLayoutHalfV{});
+                Tensor sV = make_tensor(make_smem_ptr(PLAN_V_DATA(buf_idx)), SmemLayoutHalfV{});
 
                 // Wait, issue WGMMA
                 plan.bar_k_local_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
@@ -317,6 +328,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 bar_phase_k ^= 1<<buf_idx;
 
                 cute::warpgroup_wait<0>();
+#ifdef FLASH_MLA_SM120_MODE
+                int block_phase = (block_idx - args.start_block_idx) & 1;
+                plan.bar_qk_done[buf_idx].arrive();
+#endif
 
                 // Calculate S = softmax(mask(scale(P)))
                 if (block_idx != args.start_block_idx)
@@ -329,6 +344,12 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 save_rPb_to_sP(rS, sS, idx_in_warpgroup);
                 fence_view_async_shared();
 
+#ifdef FLASH_MLA_SM120_MODE
+                plan.bar_v_local_ready[buf_idx].wait(block_phase);
+                if constexpr (CLUSTER_SIZE == 2) {
+                    plan.bar_v_remote_ready[buf_idx].wait(block_phase);
+                }
+#endif
                 // Issue O += S @ V
                 gemm<false, -1>(
                     tiled_mma_PV,
@@ -465,7 +486,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             CUTE_NO_UNROLL
             for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; block_idx++) {
                 int buf_idx = (block_idx-args.start_block_idx) % NUM_K_BUFS;
-                Tensor sV = make_tensor(make_smem_ptr(PLAN_K_DATA(buf_idx) + (SmemLayoutV{})(_256{}, _0{})), SmemLayoutHalfV{});
+                Tensor sV = make_tensor(make_smem_ptr(PLAN_V_DATA(buf_idx) + (SmemLayoutV{})(_256{}, _0{})), SmemLayoutHalfV{});
 
                 // Wait for S and sScale
                 NamedBarrier::arrive_and_wait(256, NamedBarriers::sScale_and_sS_ready);
@@ -482,6 +503,13 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     }
                 }
                 
+#ifdef FLASH_MLA_SM120_MODE
+                int block_phase = (block_idx - args.start_block_idx) & 1;
+                plan.bar_v_local_ready[buf_idx].wait(block_phase);
+                if constexpr (CLUSTER_SIZE == 2) {
+                    plan.bar_v_remote_ready[buf_idx].wait(block_phase);
+                }
+#endif
                 // Issue O += S @ V, and wait
                 gemm<false, -1>(
                     tiled_mma_PV,
@@ -756,6 +784,55 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             plan.bar_k_avail[buf_idx].wait((bar_phase_k >> buf_idx & 1) ^ 1);
                             bar_phase_k ^= 1 << buf_idx;
                         }
+                    }
+
+                    int block_phase = (block_idx - args.start_block_idx) & 1;
+                    if (round == 0) {
+                        plan.bar_qk_done[buf_idx].wait(block_phase);
+                    }
+
+                    bf16* sV_nope_base = PLAN_V_DATA(buf_idx) + (idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx)*8 + ((lane_idx/8)*16)*TOPK_BLOCK_SIZE;
+                    bf16* sV_nope_peer_base = get_peer_addr(sV_nope_base);
+                    if (CLUSTER_SIZE == 2 && round == 0 && idx_in_warpgroup == 0) {
+                        plan.bar_v_remote_ready[buf_idx].arrive_and_expect_tx((TOPK_BLOCK_SIZE/2)*HEAD_DIM_V*sizeof(bf16));
+                    }
+
+                    CUTE_UNROLL
+                    for (int dim_idx = 0; dim_idx < HEAD_DIM_NOPE/64; dim_idx += 1) {
+                        fp8x16 cur_fp8x16 = load_128b_from_gmem<fp8x16, L1CacheHint::EVICT_LAST, L2PrefetchHint::B256>(gK_nope + dim_idx*64);
+                        bf16 scale = scales[MODEL_TYPE == ModelType::V32 ? dim_idx/2 : dim_idx];
+                        auto dequant_and_save_v_bf16x8 = [&](const fp8x8 &data, int offset) {
+                            int smem_offset = (dim_idx*64 + offset) * TOPK_BLOCK_SIZE;
+                            bf16x8 cur_bf16x8 = cvt_fp8x8_bf16x8(data, __bfloat162bfloat162(*(__nv_bfloat16*)(&scale)));
+                            *(__int128_t*)(sV_nope_base + smem_offset) = *(__int128_t*)&cur_bf16x8;
+                            if constexpr (CLUSTER_SIZE == 2) {
+                                st_async_128b(sV_nope_peer_base + smem_offset, cur_bf16x8, &plan.bar_v_remote_ready[buf_idx]);
+                            }
+                        };
+                        if (token_index == -1)
+                            *(uint128_t*)(&cur_fp8x16) = uint128_t();
+                        dequant_and_save_v_bf16x8(cur_fp8x16.lo, 0);
+                        dequant_and_save_v_bf16x8(cur_fp8x16.hi, 8);
+                    }
+
+                    if constexpr (MODEL_TYPE == ModelType::MODEL1) {
+                        bf16* gK_rope = (bf16*)(gK_base+HEAD_DIM_NOPE) + (lane_idx/8)*8;
+                        bf16* sV_rope_base = PLAN_V_DATA(buf_idx) + (idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx)*8 + ((lane_idx/8)*8)*TOPK_BLOCK_SIZE;
+                        bf16* sV_rope_peer_base = get_peer_addr(sV_rope_base);
+                        CUTE_UNROLL
+                        for (int dim_idx = 0; dim_idx < HEAD_DIM_ROPE/32; dim_idx += 1) {
+                            bf16x8 cur_bf16x8 = load_128b_from_gmem<bf16x8, L1CacheHint::EVICT_LAST, L2PrefetchHint::B128>(gK_rope + dim_idx*32);
+                            if (token_index == -1)
+                                *(uint128_t*)(&cur_bf16x8) = uint128_t();
+                            int smem_offset = (HEAD_DIM_NOPE + dim_idx*32) * TOPK_BLOCK_SIZE;
+                            *(__int128_t*)(sV_rope_base + smem_offset) = *(__int128_t*)&cur_bf16x8;
+                            if constexpr (CLUSTER_SIZE == 2) {
+                                st_async_128b(sV_rope_peer_base + smem_offset, cur_bf16x8, &plan.bar_v_remote_ready[buf_idx]);
+                            }
+                        }
+                    }
+                    if (round == NUM_TOKENS_PER_THREAD - 1) {
+                        plan.bar_v_local_ready[buf_idx].arrive();
                     }
                 }
 
