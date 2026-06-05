@@ -139,6 +139,12 @@ struct SharedMemoryPlan {
 
     float sM[BLOCK_M], sL[BLOCK_M], sScale[BLOCK_M], sOScale[BLOCK_M];
     transac_bar_t bar_q, bar_k_local_ready[NUM_K_BUFS], bar_k_remote_ready[NUM_K_BUFS], bar_k_avail[NUM_K_BUFS];
+#ifdef FLASH_MLA_SM120_MODE
+    // SM120 QK pass buffers are too small to serve as the PV V tile.  After QK
+    // completes, the producer reloads the full V tile into the contiguous q+k
+    // union and synchronizes that hand-off with these barriers.
+    transac_bar_t bar_qk_done[NUM_K_BUFS], bar_v_local_ready[NUM_K_BUFS], bar_v_remote_ready[NUM_K_BUFS];
+#endif
 };
 
 template<
