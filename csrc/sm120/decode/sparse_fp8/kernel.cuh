@@ -36,7 +36,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
 
     for (int batch_idx = 0; batch_idx < params.b; batch_idx++) {
         float rM[2] = {MAX_INIT_VAL, MAX_INIT_VAL}, rL[2] = {0, 0};
-        // O accumulator: 16 rows × 512 cols per warp, 4 floats per 16×8 mma tile = 256 floats/thread
+        // O accumulator: 16 rows x 512 cols per warp, 4 floats per 16x8 mma tile = 256 floats/thread
         float rO[256]; for (int i = 0; i < 256; i++) rO[i] = 0.0f;
         float o_scales_pre[256]; for (int i = 0; i < 256; i++) o_scales_pre[i] = 1.0f;
 
@@ -50,10 +50,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                 kv_valid[i] = (__ldg(gIdx + i) != -1);
             __syncthreads();
 
-            // rP: 64 floats per thread for QK(16×64): 64/8=8 N-steps × 8 vals = 64?
-            // Actually each mma.sync produces 4 floats per thread covering 16×8.
-            // 8 N-steps × 4 = 32 floats per thread for 64 cols.
-            // But each thread has 2 row-groups × 4 cols = 8 values per N-step? No, 4 per step.
+            // rP: 64 floats per thread for QK(16x64): 64/8=8 N-steps x 8 vals = 64?
+            // Actually each mma.sync produces 4 floats per thread covering 16x8.
+            // 8 N-steps x 4 = 32 floats per thread for 64 cols.
+            // But each thread has 2 row-groups x 4 cols = 8 values per N-step? No, 4 per step.
             float rP[32]; for (int i = 0; i < 32; i++) rP[i] = 0.0f;
 
             // ---- QK passes ----
@@ -63,13 +63,13 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                 int p_tiles = p_end - p_start;
                 int p_dim = p_tiles * 64;
 
-                // Cooperative Q load (row-major, 64 × p_dim)
+                // Cooperative Q load element-by-element
                 bf16* gQp = (bf16*)params.q + batch_idx*params.stride_q_b
                           + s_q_idx*params.stride_q_s_q + start_head_idx*params.stride_q_h_q + p_start*64;
-                for (int r = threadIdx.x; r < BLOCK_M; r += NUM_THREADS)
-                    for (int c = 0; c < p_dim; c += 8)
-                        *reinterpret_cast<uint4*>(plan.q.data() + r*p_dim + c) =
-                            *reinterpret_cast<const uint4*>(gQp + r*params.stride_q_h_q + c);
+                for (int i = threadIdx.x; i < BLOCK_M * p_dim; i += NUM_THREADS) {
+                    int r = i / p_dim, c = i % p_dim;
+                    plan.q.data()[i] = gQp[r * params.stride_q_h_q + c];
+                }
                 __syncthreads();
 
                 // K dequant from FP8 cache: see sparse_fp8/../splitkv_mla.cuh producer for reference
@@ -84,18 +84,25 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                             int rel = tok % params.page_block_size;
                             fp8* gK = (fp8*)params.kv + blk*params.stride_kv_block + rel*params.stride_kv_row;
                             float sf[4];
-                            if constexpr (MODEL_TYPE == ModelType::V32)
-                                *(float4*)sf = *(const float4*)(gK + HEAD_DIM_NOPE);
-                            else { for (int si=0;si<4;si++) sf[si] = 1.0f; }
+                            if constexpr (MODEL_TYPE == ModelType::V32) {
+                                for (int si=0; si<4; si++)
+                                    sf[si] = __ldg((const float*)(gK + HEAD_DIM_NOPE) + si);
+                            } else { for (int si=0;si<4;si++) sf[si] = 1.0f; }
 
                             for (int dt = p_start; dt < p_end; dt++) {
                                 int ld = dt - p_start;
-                                fp8x16 src = *(const fp8x16*)(gK + dt*64);
+                                fp8x16 src;
+                                for (int bi=0; bi<8; bi++) {
+                                    ((uint8_t*)&src.lo)[bi] = gK[dt*64 + bi];
+                                    ((uint8_t*)&src.hi)[bi] = gK[dt*64 + 8 + bi];
+                                }
                                 bf16 sc = (bf16)sf[MODEL_TYPE==ModelType::V32 ? dt/2 : dt];
                                 bf16x8 lo = cvt_fp8x8_bf16x8(src.lo, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
                                 bf16x8 hi = cvt_fp8x8_bf16x8(src.hi, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
-                                *(bf16x8*)(row + ld*64*TOPK_BLOCK_SIZE) = lo;
-                                *(bf16x8*)(row + (ld*64+8)*TOPK_BLOCK_SIZE) = hi;
+                                for (int bi = 0; bi < 8; bi++) {
+                                    row[(ld*64 + bi)*TOPK_BLOCK_SIZE] = ((bf16*)&lo)[bi];
+                                    row[(ld*64 + 8 + bi)*TOPK_BLOCK_SIZE] = ((bf16*)&hi)[bi];
+                                }
                             }
                         } else {
                             for (int i = 0; i < p_dim; i++) row[i*TOPK_BLOCK_SIZE] = bf16(0.0f);
@@ -120,21 +127,23 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                     }
                     for (int ns = 0; ns < TOPK_BLOCK_SIZE/8; ns++) {
                         unsigned b_regs[2];
-                        int br = (lane_id%4)*2, bc0 = lane_id/4, bc1 = bc0+8;
+                        // B is (K=16, N=8): thread loads K-rows [lane%8, lane%8+8], N-cols [lane/8, lane/8+4]
+                        int bk0 = lane_id % 8, bk1 = bk0 + 8;
+                        int bn0 = lane_id / 8, bn1 = bn0 + 4;
                         *reinterpret_cast<__nv_bfloat162*>(&b_regs[0]) =
-                            *reinterpret_cast<__nv_bfloat162*>(sK_ptr + (ns*8+br)*TOPK_BLOCK_SIZE + ks*16 + bc0);
+                            *reinterpret_cast<__nv_bfloat162*>(sK_ptr + (ns*8+bn0)*TOPK_BLOCK_SIZE + ks*16 + bk0);
                         *reinterpret_cast<__nv_bfloat162*>(&b_regs[1]) =
-                            *reinterpret_cast<__nv_bfloat162*>(sK_ptr + (ns*8+br)*TOPK_BLOCK_SIZE + ks*16 + bc1);
+                            *reinterpret_cast<__nv_bfloat162*>(sK_ptr + (ns*8+bn1)*TOPK_BLOCK_SIZE + ks*16 + bk1);
 
-                        float c[4]; int pb = ns*2;
-                        c[0]=rP[pb]; c[1]=rP[pb+1]; c[2]=rP[pb+16]; c[3]=rP[pb+17];
+                        float c[4]; int pb = ns * 4;
+                        c[0]=rP[pb]; c[1]=rP[pb+1]; c[2]=rP[pb+2]; c[3]=rP[pb+3];
                         asm volatile(
                             "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                             : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                             : "r"(a_regs[0]), "r"(a_regs[1]), "r"(a_regs[2]), "r"(a_regs[3]),
                               "r"(b_regs[0]), "r"(b_regs[1]));
-                        rP[pb]=c[0]; rP[pb+1]=c[1]; rP[pb+16]=c[2]; rP[pb+17]=c[3];
+                        rP[pb]=c[0]; rP[pb+1]=c[1]; rP[pb+2]=c[2]; rP[pb+3]=c[3];
                     }
                 }
                 __syncthreads();
@@ -190,21 +199,29 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
             }
 
             // Store S to shared memory (needed for PV)
+            // Corrected register layout:
+            //   rP[ns*4+0]: S[row0, ns*8 + lane/8]
+            //   rP[ns*4+1]: S[row0, ns*8 + lane/8 + 4]
+            //   rP[ns*4+2]: S[row1, ns*8 + lane/8]
+            //   rP[ns*4+3]: S[row1, ns*8 + lane/8 + 4]
+            //   row0 = mm_row + lane%8, row1 = row0 + 8
             bf16* sS_ptr = plan.s.data();
+            int sr0 = mm_row + (lane_id % 8);
+            int sr1 = sr0 + 8;
             for (int ns = 0; ns < TOPK_BLOCK_SIZE/8; ns++) {
-                int pb = ns*2;
-                int col_base = ns*8;
-                for (int ci = 0; ci < 2; ci++) {
-                    int col = col_base + (lane_id%4)*2 + ci;
-                    if (col < TOPK_BLOCK_SIZE) {
-                        sS_ptr[(mm_row + (lane_id/4)) * TOPK_BLOCK_SIZE + col] = (bf16)rP[pb+ci];
-                        sS_ptr[(mm_row + (lane_id/4) + 8) * TOPK_BLOCK_SIZE + col] = (bf16)rP[pb+16+ci];
-                    }
+                int pb = ns * 4;
+                int sc0 = ns * 8 + (lane_id / 8);
+                int sc1 = sc0 + 4;
+                if (sc0 < TOPK_BLOCK_SIZE) {
+                    sS_ptr[sr0 * TOPK_BLOCK_SIZE + sc0] = (bf16)rP[pb];
+                    sS_ptr[sr0 * TOPK_BLOCK_SIZE + sc1] = (bf16)rP[pb + 1];
+                    sS_ptr[sr1 * TOPK_BLOCK_SIZE + sc0] = (bf16)rP[pb + 2];
+                    sS_ptr[sr1 * TOPK_BLOCK_SIZE + sc1] = (bf16)rP[pb + 3];
                 }
             }
             __syncthreads();
 
-            // ---- PV: S × V → O ----
+            // ---- PV: S x V -> O ----
             for (int vh = 0; vh < 2; vh++) {
                 static constexpr int HV = HEAD_DIM_V / 2;
                 // Load V from FP8 cache into k buffer
@@ -220,17 +237,21 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                             fp8* gK = (fp8*)params.kv + blk*params.stride_kv_block + rel*params.stride_kv_row;
                             float sf[4];
                             if constexpr (MODEL_TYPE==ModelType::V32)
-                                *(float4*)sf = *(const float4*)(gK + HEAD_DIM_NOPE);
+                                for (int si=0; si<4; si++) sf[si] = ((const float*)(gK + HEAD_DIM_NOPE))[si];
                             else { for(int si=0;si<4;si++) sf[si]=1.0f; }
                             int vo = vh*HV;
                             for (int vi = 0; vi < HV/16; vi++) {
                                 int vd = vo + vi*16;
-                                fp8x16 src = *(const fp8x16*)(gK + vd);
+                                fp8x16 src;
+                                *reinterpret_cast<uint2*>(&src.lo) = *reinterpret_cast<const uint2*>(gK + vd);
+                                *reinterpret_cast<uint2*>(&src.hi) = *reinterpret_cast<const uint2*>(gK + vd + 8);
                                 bf16 sc = vd/128<4 ? (bf16)sf[vd/128] : (bf16)1.0f;
                                 bf16x8 lo = cvt_fp8x8_bf16x8(src.lo, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
                                 bf16x8 hi = cvt_fp8x8_bf16x8(src.hi, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
-                                *(bf16x8*)(vrow + vi*16*TOPK_BLOCK_SIZE) = lo;
-                                *(bf16x8*)(vrow + (vi*16+8)*TOPK_BLOCK_SIZE) = hi;
+                                for (int bi=0; bi<8; bi++) {
+                                    vrow[(vi*16 + bi)*TOPK_BLOCK_SIZE] = ((bf16*)&lo)[bi];
+                                    vrow[(vi*16 + 8 + bi)*TOPK_BLOCK_SIZE] = ((bf16*)&hi)[bi];
+                                }
                             }
                         } else {
                             for (int i = 0; i < HV; i++) vrow[i*TOPK_BLOCK_SIZE] = bf16(0.0f);
@@ -239,7 +260,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                 }
                 __syncthreads();
 
-                // Manual mma.sync PV loop: S[16×64] × V[64×256] → O[16×256]
+                // Manual mma.sync PV loop: S[16x64] x V[64x256] -> O[16x256]
                 bf16* sS_ptr2 = plan.s.data();
                 bf16* sV_ptr = plan.k.data();
 
@@ -262,38 +283,42 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                         *reinterpret_cast<__nv_bfloat162*>(&b_regs[1]) =
                             *reinterpret_cast<__nv_bfloat162*>(sV_ptr + (ns*8+br)*TOPK_BLOCK_SIZE + ks*16 + bc1);
 
-                        int ob = ns*2 + vh*(HV/8 * 2);
+                        // 4 outputs per N-step, 128 per V-half -> 256 total per thread
+                        int ob = ns * 4 + vh * 128;
                         float c[4];
-                        c[0]=rO[ob]; c[1]=rO[ob+1]; c[2]=rO[ob+16]; c[3]=rO[ob+17];
+                        c[0]=rO[ob]; c[1]=rO[ob+1]; c[2]=rO[ob+2]; c[3]=rO[ob+3];
                         asm volatile(
                             "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                             : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                             : "r"(a_regs[0]), "r"(a_regs[1]), "r"(a_regs[2]), "r"(a_regs[3]),
                               "r"(b_regs[0]), "r"(b_regs[1]));
-                        rO[ob]=c[0]; rO[ob+1]=c[1]; rO[ob+16]=c[2]; rO[ob+17]=c[3];
+                        rO[ob]=c[0]; rO[ob+1]=c[1]; rO[ob+2]=c[2]; rO[ob+3]=c[3];
                     }
                 }
                 __syncthreads();
             }
         }  // K/V blocks
 
-        // ---- Store output: rO → global memory ----
+        // ---- Store output: rO -> global memory ----
+        // Corrected: row=lane%8/+8, col=lane/8/+4
         bf16* gO = (bf16*)params.out + batch_idx*params.stride_o_b
                  + s_q_idx*params.stride_o_s_q + start_head_idx*params.stride_o_h_q;
+        int max_row = min(params.h_q - start_head_idx, BLOCK_M);
+        int or0 = mm_row + (lane_id % 8);
+        int or1 = or0 + 8;
         for (int ns = 0; ns < HEAD_DIM_V/8; ns++) {
-            int vh_half = ns / (HEAD_DIM_V/16);
-            int ob = ns*2;
-            int col_base = ns*8;
-            for (int ci = 0; ci < 2; ci++) {
-                int col = col_base + (lane_id%4)*2 + ci;
-                if (col < HEAD_DIM_V) {
-                    int r0 = mm_row + (lane_id/4);
-                    int r1 = r0 + 8;
-                    if (r0 < params.h_q - start_head_idx)
-                        gO[r0*params.stride_o_h_q + col] = (bf16)rO[ob+ci];
-                    if (r1 < params.h_q - start_head_idx)
-                        gO[r1*params.stride_o_h_q + col] = (bf16)rO[ob+16+ci];
+            int ob = ns * 4;
+            int oc0 = ns * 8 + (lane_id / 8);
+            int oc1 = oc0 + 4;
+            if (oc0 < HEAD_DIM_V) {
+                if (or0 < max_row) {
+                    gO[or0 * params.stride_o_h_q + oc0] = (bf16)rO[ob];
+                    gO[or0 * params.stride_o_h_q + oc1] = (bf16)rO[ob + 1];
+                }
+                if (or1 < max_row) {
+                    gO[or1 * params.stride_o_h_q + oc0] = (bf16)rO[ob + 2];
+                    gO[or1 * params.stride_o_h_q + oc1] = (bf16)rO[ob + 3];
                 }
             }
         }
@@ -310,16 +335,13 @@ __global__ void sm120_global_kernel(
     KernelTemplate<MODEL_TYPE, NUM_HEADS>::template devfunc<TMAParams>(params, tma_params);
 }
 
+// Dummy TMA params (kernel uses cooperative copy, not TMA)
+struct DummyTmaParams {};
+
 template<ModelType MODEL_TYPE, int NUM_HEADS>
 void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &params) {
-    auto shape_Q = make_shape(params.h_q, params.d_qk, params.s_q, params.b);
-    auto tma_Q = cute::make_tma_copy(SM90_TMA_LOAD{},
-        make_tensor(make_gmem_ptr((bf16*)params.q),
-            make_layout(shape_Q, make_stride(params.stride_q_h_q, _1{}, params.stride_q_s_q, params.stride_q_b))),
-        SmemLayoutQPass{});
-    CUtensorMap tensor_map_o{};
-    TmaParams<decltype(shape_Q), decltype(tma_Q)> tma_params = {shape_Q, tma_Q, tensor_map_o};
-    auto kernel_fn = &sm120_global_kernel<MODEL_TYPE, NUM_HEADS, decltype(tma_params)>;
+    DummyTmaParams tma_params{};
+    auto kernel_fn = &sm120_global_kernel<MODEL_TYPE, NUM_HEADS, DummyTmaParams>;
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     KU_CUDA_CHECK(cudaFuncSetAttribute((void*)kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     dim3 grid(NUM_HEADS / 64, params.s_q, 1);
