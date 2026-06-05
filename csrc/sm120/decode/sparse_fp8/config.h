@@ -40,9 +40,12 @@ static constexpr int NUM_K_BUFS = 1;
 static constexpr int QK_TILES_PER_PASS = 5;
 static constexpr int NUM_QK_PASSES = (HEAD_DIM_K/64 + QK_TILES_PER_PASS - 1) / QK_TILES_PER_PASS;
 
-// SM80 MMA atom for BF16
+// SM80 MMA atom for BF16: 16×8×16 per atom, 4 warps → 4×8=32 atoms serialized
 using MMA_Atom = MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>;
-using TiledMMA = TiledMMA<MMA_Atom, Layout<Shape<_1, _1, _1>>>;
+using TiledMMA = decltype(make_tiled_mma(
+    MMA_Atom{},
+    Layout<Shape<_4, _8>>{},   // 4 M-atoms × 8 N-atoms = 32 atoms across 4 warps
+    Tile<_64, _64, _16>{}));   // 64×64 block tile
 
 // Simple row-major shared memory layouts (no GMMA atoms needed)
 using SmemLayoutQPass = Layout<Shape<Int<BLOCK_M>, Int<QK_TILES_PER_PASS*64>>, Stride<_1, Int<BLOCK_M>>>;
