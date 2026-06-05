@@ -32,6 +32,12 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
 
     static constexpr int TOTAL_QK_TILES = HEAD_DIM_K / 64;
     static constexpr int NUM_PASSES = (TOTAL_QK_TILES + QK_TILES_PER_PASS - 1) / QK_TILES_PER_PASS;
+
+    // MMA register mapping constants (from CuTe Layout analysis)
+    int c_row0 = lane_id % 8;
+    int c_row1 = c_row0 + 8;
+    int c_col0 = lane_id / 8;
+    int c_col1 = c_col0 + 4;
     static constexpr int PASS_DIM_S = QK_TILES_PER_PASS * 64;  // 320
 
     for (int batch_idx = 0; batch_idx < params.b; batch_idx++) {
@@ -117,23 +123,26 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
 
                 for (int ks = 0; ks < p_dim/16; ks++) {
                     unsigned a_regs[4];
-                    int ar0 = lane_id / 4, ar1 = ar0 + 8, ac = (lane_id % 4) * 2;
+                    int ar0 = lane_id % 8, ar1 = ar0 + 8, ac = (lane_id / 8) * 4;
                     for (int g = 0; g < 2; g++) {
                         int r = (g == 0 ? ar0 : ar1);
-                        *reinterpret_cast<__nv_bfloat162*>(&a_regs[g*2]) =
-                            *reinterpret_cast<__nv_bfloat162*>(sQ_ptr + (mm_row+r)*p_dim + ks*16 + ac);
-                        *reinterpret_cast<__nv_bfloat162*>(&a_regs[g*2+1]) =
-                            *reinterpret_cast<__nv_bfloat162*>(sQ_ptr + (mm_row+r)*p_dim + ks*16 + ac+1);
+                        {
+                            bf16* a_src = sQ_ptr + (mm_row+r)*p_dim + ks*16 + ac;
+                            ((bf16*)&a_regs[g*2])[0] = a_src[0];
+                            ((bf16*)&a_regs[g*2])[1] = a_src[1];
+                            ((bf16*)&a_regs[g*2+1])[0] = a_src[2];
+                            ((bf16*)&a_regs[g*2+1])[1] = a_src[3];
+                        }
                     }
                     for (int ns = 0; ns < TOPK_BLOCK_SIZE/8; ns++) {
                         unsigned b_regs[2];
                         // B is (K=16, N=8): thread loads K-rows [lane%8, lane%8+8], N-cols [lane/8, lane/8+4]
                         int bk0 = lane_id % 8, bk1 = bk0 + 8;
                         int bn0 = lane_id / 8, bn1 = bn0 + 4;
-                        *reinterpret_cast<__nv_bfloat162*>(&b_regs[0]) =
-                            *reinterpret_cast<__nv_bfloat162*>(sK_ptr + (ns*8+bn0)*TOPK_BLOCK_SIZE + ks*16 + bk0);
-                        *reinterpret_cast<__nv_bfloat162*>(&b_regs[1]) =
-                            *reinterpret_cast<__nv_bfloat162*>(sK_ptr + (ns*8+bn1)*TOPK_BLOCK_SIZE + ks*16 + bk1);
+                        ((bf16*)&b_regs[0])[0] = sK_ptr[(ns*8+bn0)*TOPK_BLOCK_SIZE + ks*16 + bk0];
+                        ((bf16*)&b_regs[0])[1] = sK_ptr[(ns*8+bn0)*TOPK_BLOCK_SIZE + ks*16 + bk0 + 1];
+                        ((bf16*)&b_regs[1])[0] = sK_ptr[(ns*8+bn1)*TOPK_BLOCK_SIZE + ks*16 + bk1];
+                        ((bf16*)&b_regs[1])[1] = sK_ptr[(ns*8+bn1)*TOPK_BLOCK_SIZE + ks*16 + bk1 + 1];
 
                         float c[4]; int pb = ns * 4;
                         c[0]=rP[pb]; c[1]=rP[pb+1]; c[2]=rP[pb+2]; c[3]=rP[pb+3];
@@ -150,48 +159,34 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
             }  // QK passes
 
             // ---- Online softmax ----
-            // Scale previous O by the ratio of old/new max; accumulate new P
+            // rP layout: ns*4+0/1 = row group 0, ns*4+2/3 = row group 1
+            // Columns: ns*8 + lane/8 (col0), ns*8 + lane/8 + 4 (col1)
             {
                 float scale_old[2];
                 for (int lr = 0; lr < 2; lr++) {
-                    int row_base = lr * 8 * 2;  // 16 elements per half-warp-row
-                    // Find max in this row's rP values
                     float cm = -INFINITY;
+                    int pb_base = lr * 2;  // offset within 4-entry group for this row
                     for (int ns = 0; ns < TOPK_BLOCK_SIZE/8; ns++) {
-                        int pb = ns*2 + lr*16;
-                        // rP[pb], rP[pb+1]: valid only if kv_valid
-                        int col_base = ns*8;
-                        for (int ci = 0; ci < 2; ci++) {
-                            int col = col_base + (lane_id%4)*2 + ci;
-                            if (kv_valid[col]) cm = fmaxf(cm, rP[pb+ci]);
-                            // The other half of registers (pb+16) is for row+8, same columns
-                            if (kv_valid[col]) cm = fmaxf(cm, rP[pb+16+ci]);
-                        }
+                        int pb = ns*4 + pb_base;
+                        int col0 = ns*8 + c_col0, col1 = col0 + 4;
+                        if (col0 < TOPK_BLOCK_SIZE && kv_valid[col0]) cm = fmaxf(cm, rP[pb]);
+                        if (col1 < TOPK_BLOCK_SIZE && kv_valid[col1]) cm = fmaxf(cm, rP[pb+1]);
                     }
                     for (int s = 1; s < 4; s *= 2) cm = fmaxf(cm, __shfl_xor_sync(0xffffffff, cm, s));
                     cm *= params.sm_scale_div_log2;
                     float om = rM[lr]; rM[lr] = fmaxf(cm, om);
                     scale_old[lr] = exp2f(om - rM[lr]);
-
-                    // Rescale O
                     for (int i = lr*128; i < lr*128+128; i++) rO[i] *= scale_old[lr];
 
-                    // Softmax and accumulate
                     float cs = 0;
                     for (int ns = 0; ns < TOPK_BLOCK_SIZE/8; ns++) {
-                        int pb = ns*2 + lr*16;
-                        for (int ci = 0; ci < 2; ci++) {
-                            int col = ns*8 + (lane_id%4)*2 + ci;
-                            if (kv_valid[col]) {
-                                float pv = exp2f(rP[pb+ci]*params.sm_scale_div_log2 - rM[lr]);
-                                rP[pb+ci] = pv;
-                                cs += pv;
-                                pv = exp2f(rP[pb+16+ci]*params.sm_scale_div_log2 - rM[lr]);
-                                rP[pb+16+ci] = pv;
-                                cs += pv;
-                            } else {
-                                rP[pb+ci] = 0; rP[pb+16+ci] = 0;
-                            }
+                        int pb = ns*4 + pb_base;
+                        int col0 = ns*8 + c_col0, col1 = col0 + 4;
+                        if (col0 < TOPK_BLOCK_SIZE) {
+                            rP[pb] = kv_valid[col0] ? exp2f(rP[pb]*params.sm_scale_div_log2 - rM[lr]) : 0;
+                            rP[pb+1] = kv_valid[col1] ? exp2f(rP[pb+1]*params.sm_scale_div_log2 - rM[lr]) : 0;
+                            if (kv_valid[col0]) cs += rP[pb];
+                            if (kv_valid[col1]) cs += rP[pb+1];
                         }
                     }
                     rL[lr] = rL[lr]*scale_old[lr] + cs;
@@ -265,23 +260,27 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                 bf16* sV_ptr = plan.k.data();
 
                 for (int ks = 0; ks < TOPK_BLOCK_SIZE/16; ks++) {
-                    // Load A: S[mm:16, ks*16:(ks+1)*16] from shared
+                    // Load A: S[mm:16, ks*16:(ks+1)*16], row=lane%8/+8, col=(lane/8)*4
                     unsigned a_regs[4];
-                    int ar0 = lane_id/4, ar1 = ar0+8, ac = (lane_id%4)*2;
+                    int ar0 = lane_id % 8, ar1 = ar0 + 8, ac = (lane_id / 8) * 4;
                     for (int g = 0; g < 2; g++) {
                         int r = (g==0 ? ar0 : ar1);
-                        *reinterpret_cast<__nv_bfloat162*>(&a_regs[g*2]) =
-                            *reinterpret_cast<__nv_bfloat162*>(sS_ptr2 + (mm_row+r)*TOPK_BLOCK_SIZE + ks*16 + ac);
-                        *reinterpret_cast<__nv_bfloat162*>(&a_regs[g*2+1]) =
-                            *reinterpret_cast<__nv_bfloat162*>(sS_ptr2 + (mm_row+r)*TOPK_BLOCK_SIZE + ks*16 + ac+1);
+                        {
+                            bf16* a_src = sS_ptr2 + (mm_row+r)*TOPK_BLOCK_SIZE + ks*16 + ac;
+                            ((bf16*)&a_regs[g*2])[0] = a_src[0];
+                            ((bf16*)&a_regs[g*2])[1] = a_src[1];
+                            ((bf16*)&a_regs[g*2+1])[0] = a_src[2];
+                            ((bf16*)&a_regs[g*2+1])[1] = a_src[3];
+                        }
                     }
                     for (int ns = 0; ns < HV/8; ns++) {
                         unsigned b_regs[2];
-                        int br = (lane_id%4)*2, bc0 = lane_id/4, bc1 = bc0+8;
-                        *reinterpret_cast<__nv_bfloat162*>(&b_regs[0]) =
-                            *reinterpret_cast<__nv_bfloat162*>(sV_ptr + (ns*8+br)*TOPK_BLOCK_SIZE + ks*16 + bc0);
-                        *reinterpret_cast<__nv_bfloat162*>(&b_regs[1]) =
-                            *reinterpret_cast<__nv_bfloat162*>(sV_ptr + (ns*8+br)*TOPK_BLOCK_SIZE + ks*16 + bc1);
+                        int bk0 = lane_id % 8, bk1 = bk0 + 8;
+                        int bn0 = lane_id / 8, bn1 = bn0 + 4;
+                        ((bf16*)&b_regs[0])[0] = sV_ptr[(ns*8+bn0)*TOPK_BLOCK_SIZE + ks*16 + bk0];
+                        ((bf16*)&b_regs[0])[1] = sV_ptr[(ns*8+bn0)*TOPK_BLOCK_SIZE + ks*16 + bk0 + 1];
+                        ((bf16*)&b_regs[1])[0] = sV_ptr[(ns*8+bn1)*TOPK_BLOCK_SIZE + ks*16 + bk1];
+                        ((bf16*)&b_regs[1])[1] = sV_ptr[(ns*8+bn1)*TOPK_BLOCK_SIZE + ks*16 + bk1 + 1];
 
                         // 4 outputs per N-step, 128 per V-half -> 256 total per thread
                         int ob = ns * 4 + vh * 128;
