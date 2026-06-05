@@ -123,16 +123,17 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
 
                 for (int ks = 0; ks < p_dim/16; ks++) {
                     unsigned a_regs[4];
-                    int ar0 = lane_id % 8, ar1 = ar0 + 8, ac = (lane_id / 8) * 4;
+                    int ar0 = lane_id % 8, ar1 = ar0 + 8;
+                    int a_col = (lane_id / 8) * 4;
                     for (int g = 0; g < 2; g++) {
                         int r = (g == 0 ? ar0 : ar1);
-                        {
-                            bf16* a_src = sQ_ptr + (mm_row+r)*p_dim + ks*16 + ac;
-                            ((bf16*)&a_regs[g*2])[0] = a_src[0];
-                            ((bf16*)&a_regs[g*2])[1] = a_src[1];
-                            ((bf16*)&a_regs[g*2+1])[0] = a_src[2];
-                            ((bf16*)&a_regs[g*2+1])[1] = a_src[3];
-                        }
+                        bf16* a_src = sQ_ptr + (mm_row+r)*p_dim + ks*16;
+                        // MMA A register: 4 pairs = (col, col+1), (col+8, col+9)
+                        // repeated for each of 2 row groups
+                        ((bf16*)&a_regs[g*2])[0]   = a_src[a_col];
+                        ((bf16*)&a_regs[g*2])[1]   = a_src[a_col + 1];
+                        ((bf16*)&a_regs[g*2+1])[0] = a_src[a_col + 8];
+                        ((bf16*)&a_regs[g*2+1])[1] = a_src[a_col + 9];
                     }
                     for (int ns = 0; ns < TOPK_BLOCK_SIZE/8; ns++) {
                         unsigned b_regs[2];
@@ -262,16 +263,15 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                 for (int ks = 0; ks < TOPK_BLOCK_SIZE/16; ks++) {
                     // Load A: S[mm:16, ks*16:(ks+1)*16], row=lane%8/+8, col=(lane/8)*4
                     unsigned a_regs[4];
-                    int ar0 = lane_id % 8, ar1 = ar0 + 8, ac = (lane_id / 8) * 4;
+                    int ar0 = lane_id % 8, ar1 = ar0 + 8;
+                    int a_col = (lane_id / 8) * 4;
                     for (int g = 0; g < 2; g++) {
                         int r = (g==0 ? ar0 : ar1);
-                        {
-                            bf16* a_src = sS_ptr2 + (mm_row+r)*TOPK_BLOCK_SIZE + ks*16 + ac;
-                            ((bf16*)&a_regs[g*2])[0] = a_src[0];
-                            ((bf16*)&a_regs[g*2])[1] = a_src[1];
-                            ((bf16*)&a_regs[g*2+1])[0] = a_src[2];
-                            ((bf16*)&a_regs[g*2+1])[1] = a_src[3];
-                        }
+                        bf16* a_src = sS_ptr2 + (mm_row+r)*TOPK_BLOCK_SIZE + ks*16;
+                        ((bf16*)&a_regs[g*2])[0]   = a_src[a_col];
+                        ((bf16*)&a_regs[g*2])[1]   = a_src[a_col + 1];
+                        ((bf16*)&a_regs[g*2+1])[0] = a_src[a_col + 8];
+                        ((bf16*)&a_regs[g*2+1])[1] = a_src[a_col + 9];
                     }
                     for (int ns = 0; ns < HV/8; ns++) {
                         unsigned b_regs[2];
@@ -324,7 +324,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
         __syncthreads();
     }
 #endif
-}
+}  // devfunc
 
 template<ModelType MODEL_TYPE, int NUM_HEADS, typename TMAParams>
 __global__ void sm120_global_kernel(
@@ -355,3 +355,4 @@ void run_sm120_sparse_decode_kernel(const SparseAttnDecodeParams &params) {
 }
 
 }  // namespace sm120::decode::sparse_fp8
+
