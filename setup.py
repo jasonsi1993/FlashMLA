@@ -20,6 +20,9 @@ def get_features_args():
     features_args = []
     if is_flag_set("FLASH_MLA_DISABLE_FP16"):
         features_args.append("-DFLASH_MLA_DISABLE_FP16")
+    if not is_flag_set("FLASH_MLA_DISABLE_SM120"):
+        # Host-side flag so run() uses the smaller SM120 SharedMemoryPlan
+        features_args.append("-DFLASH_MLA_HOST_HAS_SM120")
     return features_args
 
 def get_arch_flags():
@@ -33,12 +36,15 @@ def get_arch_flags():
     major, minor = map(int, nvcc_version_number.split('.'))
     print(f'Compiling using NVCC {major}.{minor}')
 
+    DISABLE_SM120 = is_flag_set("FLASH_MLA_DISABLE_SM120")
     DISABLE_SM100 = is_flag_set("FLASH_MLA_DISABLE_SM100")
     DISABLE_SM90 = is_flag_set("FLASH_MLA_DISABLE_SM90")
     if major < 12 or (major == 12 and minor <= 8):
         assert DISABLE_SM100, "sm100 compilation for Flash MLA requires NVCC 12.9 or higher. Please set FLASH_MLA_DISABLE_SM100=1 to disable sm100 compilation, or update your environment."    # TODO Implement this
 
     arch_flags = []
+    if not DISABLE_SM120:
+        arch_flags.extend(["-gencode", "arch=compute_120,code=sm_120"])
     if not DISABLE_SM100:
         arch_flags.extend(["-gencode", "arch=compute_100f,code=sm_100f"])
     if not DISABLE_SM90:

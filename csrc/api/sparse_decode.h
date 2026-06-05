@@ -58,8 +58,14 @@ class Decode_Sm90_Impl : public DecodeImplBase {
 public:
     DecodeImplMeta get_meta(int h_q, int s_q) override {
         Arch arch = Arch();
+        int num_sm_parts = std::max(arch.num_sms / s_q / (h_q/64), 1);
+        // SM120 has only 99KB shared memory per block; force no-split mode
+        // to use oBuf (64KB) instead of oAccumBuf (128KB)
+        if (arch.is_sm120f()) {
+            num_sm_parts = 1;
+        }
         return {
-            std::max(arch.num_sms / s_q / (h_q/64), 1),
+            num_sm_parts,
             5,
             64
         };
@@ -108,7 +114,7 @@ protected:
 
 
 // An implementation that calls the head64 kernel twice to process head128
-// Necessary for running V3.2 shape (i.e. h = 128, d_qk = 576) on SM100f
+// Necessary for running V3.2 shape (i.e. h = 128, d_qk = 576) on SM100f and SM120f
 class Decode_Sm100_Head64x2_Impl : public DecodeImplBase {
     DECLARE_SUPPORTED_FEATURES(
         DecodeFeatures::HEAD_128,
@@ -374,7 +380,8 @@ sparse_attn_decode_interface(
         } else {
             TORCH_CHECK(false, "Unsupported h_q: ", h_q);
         }
-    } else if (arch.is_sm90a()) {
+    } else if (arch.is_sm90a() || arch.is_sm120f()) {
+        // SM90 kernels use GMMA instructions which compile for SM120
         impl = new Decode_Sm90_Impl();
     } else {
         TORCH_CHECK(false, "Unsupported architecture for sparse decode fwd");
