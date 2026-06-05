@@ -743,8 +743,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             } else {
                                 gK_rope = (bf16*)(gK_base+HEAD_DIM_NOPE) + (lane_idx/8)*8;
                             }
+                            // smem_offset already includes pass_nope_tiles*64, don't double-count
                             bf16* sK_rope_base_pass = PLAN_K_DATA(buf_idx) + (idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx)*8
-                                + pass_nope_tiles*64*TOPK_BLOCK_SIZE + ((lane_idx/8)*8)*TOPK_BLOCK_SIZE;
+                                + ((lane_idx/8)*8)*TOPK_BLOCK_SIZE;
                             bf16* sK_rope_peer_base_pass = get_peer_addr(sK_rope_base_pass);
 
                             CUTE_UNROLL

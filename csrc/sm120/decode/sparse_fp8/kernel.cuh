@@ -50,7 +50,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                 kv_valid[i] = (__ldg(gIdx + i) != -1);
             __syncthreads();
 
-            // rP accumulator: 32 floats per thread (16 rows × 64 cols, 4 floats per 16×8 tile, 8 N-steps)
+            // rP: 64 floats per thread for QK(16×64): 64/8=8 N-steps × 8 vals = 64?
+            // Actually each mma.sync produces 4 floats per thread covering 16×8.
+            // 8 N-steps × 4 = 32 floats per thread for 64 cols.
+            // But each thread has 2 row-groups × 4 cols = 8 values per N-step? No, 4 per step.
             float rP[32]; for (int i = 0; i < 32; i++) rP[i] = 0.0f;
 
             // ---- QK passes ----
