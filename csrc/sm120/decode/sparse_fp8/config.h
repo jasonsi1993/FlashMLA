@@ -80,6 +80,11 @@ static __forceinline__ __device__ void sync_all_threads() {
     __syncthreads();
 }
 
+template<typename TMAParams>
+static __device__ void devfunc(
+    const SparseAttnDecodeParams &params,
+    const TMAParams &tma_params);
+
 static void run(const SparseAttnDecodeParams &params);
 
 };
