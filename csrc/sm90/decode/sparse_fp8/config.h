@@ -160,11 +160,6 @@ using TiledMMA_QK = decltype(make_tiled_mma(
     Layout<Shape<_1, _1, _1>>{}
 ));
 
-using TiledMMA_QK_rQ = decltype(make_tiled_mma(
-    GMMA::MMA_64x64x16_F32BF16BF16_RS<GMMA::Major::K, GMMA::Major::K>{},
-    Layout<Shape<_1, _1, _1>>{}
-));
-
 using TiledMMA_PV_LocalP = decltype(make_tiled_mma(
     GMMA::MMA_64x256x16_F32BF16BF16_RS<GMMA::Major::K, GMMA::Major::MN>{},
     Layout<Shape<_1, _1, _1>>{}

@@ -308,12 +308,30 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             }
                         }
 
-                        gemm<true, -1>(
-                            tiled_mma_QK,
-                            thr_mma_QK.partition_fragment_A(sQ),
-                            thr_mma_QK.partition_fragment_B(sK),
-                            rP
-                        );
+                        if (qk_pass == 0) {
+                            gemm<true, -1>(
+                                tiled_mma_QK,
+                                thr_mma_QK.partition_fragment_A(sQ),
+                                thr_mma_QK.partition_fragment_B(sK),
+                                rP
+                            );
+                        } else {
+                            // The second SM120 pass has fewer than QK_TILES_PER_PASS
+                            // K-tiles (MODEL1: 192 dims, V32: 256 dims).  Restrict
+                            // CuTe's A/B fragments to exactly that logical tile so the
+                            // GMMA register/thread layout is derived from the same
+                            // shape that was loaded for Q and K, rather than relying on
+                            // stale/zero-filled padding in the 320-dim pass buffer.  This
+                            // pass accumulates into rP instead of clearing pass 0 results.
+                            Tensor sQ_tail = local_tile(sQ, Shape<Int<BLOCK_M>, Int<LAST_PASS_DIM>>{}, make_coord(_0{}, _0{}));
+                            Tensor sK_tail = local_tile(sK, Shape<Int<TOPK_BLOCK_SIZE>, Int<LAST_PASS_DIM>>{}, make_coord(_0{}, _0{}));
+                            gemm<false, -1>(
+                                tiled_mma_QK,
+                                thr_mma_QK.partition_fragment_A(sQ_tail),
+                                thr_mma_QK.partition_fragment_B(sK_tail),
+                                rP
+                            );
+                        }
                     }
                 }
 #else
