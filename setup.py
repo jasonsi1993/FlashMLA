@@ -86,6 +86,9 @@ ext_modules.append(
             "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu",
             "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu",
 
+            # sm120 sparse decode (SM80-MMA kernel)
+            "csrc/sm120/decode/sparse_fp8/instantiations/v32_h64.cu",
+
             # sm90 sparse prefill
             "csrc/sm90/prefill/sparse/fwd.cu",
             "csrc/sm90/prefill/sparse/instantiations/phase1_k512.cu",
