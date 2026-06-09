@@ -340,7 +340,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
 
         int max_row = min(params.h_q - start_head_idx, BLOCK_M);
         float o_scale[2];
-        float attn_sink_val[2] = {0.0f, 0.0f};
+        float attn_sink_val[2] = {MAX_INIT_VAL, MAX_INIT_VAL};  // -1e30, effectively 0 contribution when no sink
         if (params.attn_sink != nullptr) {
             if (row0 < params.h_q) attn_sink_val[0] = __ldg((const float*)params.attn_sink + start_head_idx + row0) * (float)M_LOG2E;
             if (row1 < params.h_q) attn_sink_val[1] = __ldg((const float*)params.attn_sink + start_head_idx + row1) * (float)M_LOG2E;
