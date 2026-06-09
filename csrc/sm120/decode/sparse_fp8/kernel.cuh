@@ -276,6 +276,22 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                             int vo = vh*HV;
                             for (int vi = 0; vi < HV/16; vi++) {
                                 int vd = vo + vi*16;
+                                if constexpr (MODEL_TYPE == ModelType::MODEL1) {
+                                    // Dims 448-511 overlap with K RoPE (bf16) region; load directly as bf16
+                                    if (vd >= HEAD_DIM_NOPE) {
+                                        bf16x8 lo, hi;
+                                        bf16* gV_bf16 = (bf16*)(gK + HEAD_DIM_NOPE);
+                                        for (int bi = 0; bi < 8; bi++) {
+                                            ((bf16*)&lo)[bi] = gV_bf16[(vd - HEAD_DIM_NOPE) + bi];
+                                            ((bf16*)&hi)[bi] = gV_bf16[(vd - HEAD_DIM_NOPE) + 8 + bi];
+                                        }
+                                        for (int bi = 0; bi < 8; bi++) {
+                                            vrow[vi*16 + bi] = ((bf16*)&lo)[bi];
+                                            vrow[vi*16 + 8 + bi] = ((bf16*)&hi)[bi];
+                                        }
+                                        continue;
+                                    }
+                                }
                                 fp8x16 src;
                                 *reinterpret_cast<uint2*>(&src.lo) = *reinterpret_cast<const uint2*>(gK + vd);
                                 *reinterpret_cast<uint2*>(&src.hi) = *reinterpret_cast<const uint2*>(gK + vd + 8);
