@@ -36,6 +36,12 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
 
     int c_col0 = lane_id / 8;  // used by softmax
 
+    // Diagnostic: zero-init shared memory to rule out cold-start read-before-write
+    for (int i = threadIdx.x; i < sizeof(SharedMemoryPlan)/4; i += NUM_THREADS) {
+        ((int*)wksp_buf)[i] = 0;
+    }
+    __syncthreads();
+
     for (int batch_idx = 0; batch_idx < params.b; batch_idx++) {
         float rM[2] = {MAX_INIT_VAL, MAX_INIT_VAL}, rL[2] = {0, 0};
         // O accumulator: 16 rows x 512 cols per warp, 4 floats per 16x8 mma tile = 256 floats/thread
