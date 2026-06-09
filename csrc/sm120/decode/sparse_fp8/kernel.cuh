@@ -10,6 +10,7 @@
 namespace sm120::decode::sparse_fp8 {
 using sm90::decode::sparse_fp8::fp8x16;
 using sm90::decode::sparse_fp8::cvt_fp8x8_bf16x8;
+using fp8_e8m0 = __nv_fp8_e8m0;
 
 static constexpr float MAX_INIT_VAL = -1e30;
 
@@ -33,27 +34,19 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
     static constexpr int TOTAL_QK_TILES = HEAD_DIM_K / 64;
     static constexpr int NUM_PASSES = (TOTAL_QK_TILES + QK_TILES_PER_PASS - 1) / QK_TILES_PER_PASS;
 
-    // MMA register mapping constants (from CuTe Layout analysis)
-    int c_row0 = lane_id % 8;
-    int c_row1 = c_row0 + 8;
-    int c_col0 = lane_id / 8;
-    int c_col1 = c_col0 + 4;
-    static constexpr int PASS_DIM_S = QK_TILES_PER_PASS * 64;  // 320
+    int c_col0 = lane_id / 8;  // used by softmax
 
     for (int batch_idx = 0; batch_idx < params.b; batch_idx++) {
         float rM[2] = {MAX_INIT_VAL, MAX_INIT_VAL}, rL[2] = {0, 0};
         // O accumulator: 16 rows x 512 cols per warp, 4 floats per 16x8 mma tile = 256 floats/thread
         float rO[256]; for (int i = 0; i < 256; i++) rO[i] = 0.0f;
-        float o_scales_pre[256]; for (int i = 0; i < 256; i++) o_scales_pre[i] = 1.0f;
-
         int total_blocks = params.topk / TOPK_BLOCK_SIZE;
         for (int block_idx = 0; block_idx < total_blocks; block_idx++) {
-            // is_kv_valid
-            bool kv_valid[TOPK_BLOCK_SIZE];
+            // is_kv_valid -- SHARED memory so ALL threads can read ALL entries
             int* gIdx = params.indices + batch_idx*params.stride_indices_b
                        + s_q_idx*params.stride_indices_s_q + block_idx*TOPK_BLOCK_SIZE;
             for (int i = threadIdx.x; i < TOPK_BLOCK_SIZE; i += NUM_THREADS)
-                kv_valid[i] = (__ldg(gIdx + i) != -1);
+                plan.is_kv_valid[i] = (__ldg(gIdx + i) != -1);
             __syncthreads();
 
             // rP: 64 floats per thread for QK(16x64): 64/8=8 N-steps x 8 vals = 64?
@@ -84,34 +77,61 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                     for (int t = threadIdx.x; t < TOPK_BLOCK_SIZE; t += NUM_THREADS) {
                         int tok = __ldg(params.indices + batch_idx*params.stride_indices_b
                                        + s_q_idx*params.stride_indices_s_q + toff + t);
-                        bf16* row = plan.k.data() + t;
+                        static constexpr int TSTRIDE = (MODEL_TYPE == ModelType::V32)
+                            ? 0 : (HEAD_DIM_NOPE + 2 * HEAD_DIM_ROPE);
+                        const int rs = (MODEL_TYPE == ModelType::V32) ? params.stride_kv_row : TSTRIDE;
+                        bf16* row = plan.k.data() + t * p_dim;
                         if (tok != -1) {
                             int blk = tok / params.page_block_size;
                             int rel = tok % params.page_block_size;
-                            fp8* gK = (fp8*)params.kv + blk*params.stride_kv_block + rel*params.stride_kv_row;
-                            float sf[4];
+                            fp8* gK = (fp8*)params.kv + blk*params.stride_kv_block + rel*rs;
+                            float sf[NUM_SCALES];
                             if constexpr (MODEL_TYPE == ModelType::V32) {
                                 for (int si=0; si<4; si++)
                                     sf[si] = __ldg((const float*)(gK + HEAD_DIM_NOPE) + si);
-                            } else { for (int si=0;si<4;si++) sf[si] = 1.0f; }
+                            } else {
+                                uint8_t* bsc = (uint8_t*)((fp8*)params.kv + blk*params.stride_kv_block)
+                                             + params.page_block_size * TSTRIDE;
+                                fp8_e8m0* se8 = (fp8_e8m0*)(bsc + rel * NUM_SCALES);
+                                for (int si=0; si<NUM_SCALES; si+=2)
+                                    *(__nv_bfloat162_raw*)(sf+si) = __nv_cvt_e8m0x2_to_bf162raw(*(__nv_fp8x2_storage_t*)(se8+si));
+                            }
+
+                            static constexpr int N_NOPE = HEAD_DIM_NOPE / 64;
+                            bf16* gK_rope = (MODEL_TYPE == ModelType::V32)
+                                ? (bf16*)((uint8_t*)gK + HEAD_DIM_NOPE + 4 * sizeof(float))
+                                : (bf16*)(gK + HEAD_DIM_NOPE);
 
                             for (int dt = p_start; dt < p_end; dt++) {
                                 int ld = dt - p_start;
-                                fp8x16 src;
-                                for (int bi=0; bi<8; bi++) {
-                                    ((uint8_t*)&src.lo)[bi] = gK[dt*64 + bi];
-                                    ((uint8_t*)&src.hi)[bi] = gK[dt*64 + 8 + bi];
-                                }
-                                bf16 sc = (bf16)sf[MODEL_TYPE==ModelType::V32 ? dt/2 : dt];
-                                bf16x8 lo = cvt_fp8x8_bf16x8(src.lo, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
-                                bf16x8 hi = cvt_fp8x8_bf16x8(src.hi, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
-                                for (int bi = 0; bi < 8; bi++) {
-                                    row[(ld*64 + bi)*TOPK_BLOCK_SIZE] = ((bf16*)&lo)[bi];
-                                    row[(ld*64 + 8 + bi)*TOPK_BLOCK_SIZE] = ((bf16*)&hi)[bi];
+                                if (dt < N_NOPE) {
+                                    fp8x16 src;
+                                    for (int bi=0; bi<8; bi++) {
+                                        ((uint8_t*)&src.lo)[bi] = gK[dt*64 + bi];
+                                        ((uint8_t*)&src.hi)[bi] = gK[dt*64 + 8 + bi];
+                                    }
+                                    bf16 sc = (bf16)sf[MODEL_TYPE==ModelType::V32 ? dt/2 : dt];
+                                    bf16x8 lo = cvt_fp8x8_bf16x8(src.lo, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
+                                    bf16x8 hi = cvt_fp8x8_bf16x8(src.hi, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
+                                    for (int bi = 0; bi < 8; bi++) {
+                                        row[ld*64 + bi] = ((bf16*)&lo)[bi];
+                                        row[ld*64 + 8 + bi] = ((bf16*)&hi)[bi];
+                                    }
+                                } else {
+                                    int rd = dt - N_NOPE;
+                                    bf16x8 lo, hi;
+                                    for (int bi = 0; bi < 8; bi++) {
+                                        ((bf16*)&lo)[bi] = gK_rope[rd*64 + bi];
+                                        ((bf16*)&hi)[bi] = gK_rope[rd*64 + 8 + bi];
+                                    }
+                                    for (int bi = 0; bi < 8; bi++) {
+                                        row[ld*64 + bi] = ((bf16*)&lo)[bi];
+                                        row[ld*64 + 8 + bi] = ((bf16*)&hi)[bi];
+                                    }
                                 }
                             }
                         } else {
-                            for (int i = 0; i < p_dim; i++) row[i*TOPK_BLOCK_SIZE] = bf16(0.0f);
+                            for (int i = 0; i < p_dim; i++) row[i] = bf16(0.0f);
                         }
                     }
                 }
@@ -140,10 +160,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                         // B is (K=16, N=8): thread loads K-rows [lane%8, lane%8+8], N-cols [lane/8, lane/8+4]
                         int bk0 = lane_id % 8, bk1 = bk0 + 8;
                         int bn0 = lane_id / 8, bn1 = bn0 + 4;
-                        ((bf16*)&b_regs[0])[0] = sK_ptr[(ns*8+bn0)*TOPK_BLOCK_SIZE + ks*16 + bk0];
-                        ((bf16*)&b_regs[0])[1] = sK_ptr[(ns*8+bn0)*TOPK_BLOCK_SIZE + ks*16 + bk0 + 1];
-                        ((bf16*)&b_regs[1])[0] = sK_ptr[(ns*8+bn1)*TOPK_BLOCK_SIZE + ks*16 + bk1];
-                        ((bf16*)&b_regs[1])[1] = sK_ptr[(ns*8+bn1)*TOPK_BLOCK_SIZE + ks*16 + bk1 + 1];
+                        ((bf16*)&b_regs[0])[0] = sK_ptr[(ns*8+bn0)*p_dim + ks*16 + bk0];
+                        ((bf16*)&b_regs[0])[1] = sK_ptr[(ns*8+bn0)*p_dim + ks*16 + bk0 + 1];
+                        ((bf16*)&b_regs[1])[0] = sK_ptr[(ns*8+bn1)*p_dim + ks*16 + bk1];
+                        ((bf16*)&b_regs[1])[1] = sK_ptr[(ns*8+bn1)*p_dim + ks*16 + bk1 + 1];
 
                         float c[4]; int pb = ns * 4;
                         c[0]=rP[pb]; c[1]=rP[pb+1]; c[2]=rP[pb+2]; c[3]=rP[pb+3];
@@ -170,10 +190,11 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                     for (int ns = 0; ns < TOPK_BLOCK_SIZE/8; ns++) {
                         int pb = ns*4 + pb_base;
                         int col0 = ns*8 + c_col0, col1 = col0 + 4;
-                        if (col0 < TOPK_BLOCK_SIZE && kv_valid[col0]) cm = fmaxf(cm, rP[pb]);
-                        if (col1 < TOPK_BLOCK_SIZE && kv_valid[col1]) cm = fmaxf(cm, rP[pb+1]);
+                        if (col0 < TOPK_BLOCK_SIZE && plan.is_kv_valid[col0]) cm = fmaxf(cm, rP[pb]);
+                        if (col1 < TOPK_BLOCK_SIZE && plan.is_kv_valid[col1]) cm = fmaxf(cm, rP[pb+1]);
                     }
-                    for (int s = 1; s < 4; s *= 2) cm = fmaxf(cm, __shfl_xor_sync(0xffffffff, cm, s));
+                    cm = fmaxf(cm, __shfl_xor_sync(0xffffffff, cm, 8));
+                    cm = fmaxf(cm, __shfl_xor_sync(0xffffffff, cm, 16));
                     cm *= params.sm_scale_div_log2;
                     float om = rM[lr]; rM[lr] = fmaxf(cm, om);
                     scale_old[lr] = exp2f(om - rM[lr]);
@@ -184,12 +205,14 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                         int pb = ns*4 + pb_base;
                         int col0 = ns*8 + c_col0, col1 = col0 + 4;
                         if (col0 < TOPK_BLOCK_SIZE) {
-                            rP[pb] = kv_valid[col0] ? exp2f(rP[pb]*params.sm_scale_div_log2 - rM[lr]) : 0;
-                            rP[pb+1] = kv_valid[col1] ? exp2f(rP[pb+1]*params.sm_scale_div_log2 - rM[lr]) : 0;
-                            if (kv_valid[col0]) cs += rP[pb];
-                            if (kv_valid[col1]) cs += rP[pb+1];
+                            rP[pb] = plan.is_kv_valid[col0] ? exp2f(rP[pb]*params.sm_scale_div_log2 - rM[lr]) : 0;
+                            rP[pb+1] = plan.is_kv_valid[col1] ? exp2f(rP[pb+1]*params.sm_scale_div_log2 - rM[lr]) : 0;
+                            if (plan.is_kv_valid[col0]) cs += rP[pb];
+                            if (plan.is_kv_valid[col1]) cs += rP[pb+1];
                         }
                     }
+                    cs += __shfl_xor_sync(0xffffffff, cs, 8);
+                    cs += __shfl_xor_sync(0xffffffff, cs, 16);
                     rL[lr] = rL[lr]*scale_old[lr] + cs;
                 }
             }
@@ -226,31 +249,40 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                     for (int t = threadIdx.x; t < TOPK_BLOCK_SIZE; t += NUM_THREADS) {
                         int tok = __ldg(params.indices + batch_idx*params.stride_indices_b
                                        + s_q_idx*params.stride_indices_s_q + toff + t);
-                        bf16* vrow = plan.k.data() + t;
+                        bf16* vrow = plan.k.data() + t * HV;
                         if (tok != -1) {
                             int blk = tok / params.page_block_size;
                             int rel = tok % params.page_block_size;
-                            fp8* gK = (fp8*)params.kv + blk*params.stride_kv_block + rel*params.stride_kv_row;
-                            float sf[4];
+                            static constexpr int TSV = (MODEL_TYPE == ModelType::V32) ? 0 : (HEAD_DIM_NOPE + 2 * HEAD_DIM_ROPE);
+                            const int rsv = (MODEL_TYPE == ModelType::V32) ? params.stride_kv_row : TSV;
+                            fp8* gK = (fp8*)params.kv + blk*params.stride_kv_block + rel*rsv;
+                            float sf[NUM_SCALES];
                             if constexpr (MODEL_TYPE==ModelType::V32)
                                 for (int si=0; si<4; si++) sf[si] = ((const float*)(gK + HEAD_DIM_NOPE))[si];
-                            else { for(int si=0;si<4;si++) sf[si]=1.0f; }
+                            else {
+                                static constexpr int TS2 = HEAD_DIM_NOPE + 2 * HEAD_DIM_ROPE;
+                                uint8_t* bsc2 = (uint8_t*)((fp8*)params.kv + blk*params.stride_kv_block)
+                                               + params.page_block_size * TS2;
+                                fp8_e8m0* se2 = (fp8_e8m0*)(bsc2 + rel * NUM_SCALES);
+                                for (int si=0; si<NUM_SCALES; si+=2)
+                                    *(__nv_bfloat162_raw*)(sf+si) = __nv_cvt_e8m0x2_to_bf162raw(*(__nv_fp8x2_storage_t*)(se2+si));
+                            }
                             int vo = vh*HV;
                             for (int vi = 0; vi < HV/16; vi++) {
                                 int vd = vo + vi*16;
                                 fp8x16 src;
                                 *reinterpret_cast<uint2*>(&src.lo) = *reinterpret_cast<const uint2*>(gK + vd);
                                 *reinterpret_cast<uint2*>(&src.hi) = *reinterpret_cast<const uint2*>(gK + vd + 8);
-                                bf16 sc = vd/128<4 ? (bf16)sf[vd/128] : (bf16)1.0f;
+                                bf16 sc = (vd/QUANT_TILE_SIZE < NUM_SCALES) ? (bf16)sf[vd/QUANT_TILE_SIZE] : (bf16)1.0f;
                                 bf16x8 lo = cvt_fp8x8_bf16x8(src.lo, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
                                 bf16x8 hi = cvt_fp8x8_bf16x8(src.hi, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
                                 for (int bi=0; bi<8; bi++) {
-                                    vrow[(vi*16 + bi)*TOPK_BLOCK_SIZE] = ((bf16*)&lo)[bi];
-                                    vrow[(vi*16 + 8 + bi)*TOPK_BLOCK_SIZE] = ((bf16*)&hi)[bi];
+                                    vrow[vi*16 + bi] = ((bf16*)&lo)[bi];
+                                    vrow[vi*16 + 8 + bi] = ((bf16*)&hi)[bi];
                                 }
                             }
                         } else {
-                            for (int i = 0; i < HV; i++) vrow[i*TOPK_BLOCK_SIZE] = bf16(0.0f);
+                            for (int i = 0; i < HV; i++) vrow[i] = bf16(0.0f);
                         }
                     }
                 }
@@ -277,10 +309,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                         unsigned b_regs[2];
                         int bk0 = lane_id % 8, bk1 = bk0 + 8;
                         int bn0 = lane_id / 8, bn1 = bn0 + 4;
-                        ((bf16*)&b_regs[0])[0] = sV_ptr[(ns*8+bn0)*TOPK_BLOCK_SIZE + ks*16 + bk0];
-                        ((bf16*)&b_regs[0])[1] = sV_ptr[(ns*8+bn0)*TOPK_BLOCK_SIZE + ks*16 + bk0 + 1];
-                        ((bf16*)&b_regs[1])[0] = sV_ptr[(ns*8+bn1)*TOPK_BLOCK_SIZE + ks*16 + bk1];
-                        ((bf16*)&b_regs[1])[1] = sV_ptr[(ns*8+bn1)*TOPK_BLOCK_SIZE + ks*16 + bk1 + 1];
+                        ((bf16*)&b_regs[0])[0] = sV_ptr[(ks*16 + bk0)*HV + (ns*8+bn0)];
+                        ((bf16*)&b_regs[0])[1] = sV_ptr[(ks*16 + bk0 + 1)*HV + (ns*8+bn0)];
+                        ((bf16*)&b_regs[1])[0] = sV_ptr[(ks*16 + bk1)*HV + (ns*8+bn1)];
+                        ((bf16*)&b_regs[1])[1] = sV_ptr[(ks*16 + bk1 + 1)*HV + (ns*8+bn1)];
 
                         // 4 outputs per N-step, 128 per V-half -> 256 total per thread
                         int ob = ns * 4 + vh * 128;
@@ -299,25 +331,57 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
             }
         }  // K/V blocks
 
-        // ---- Store output: rO -> global memory ----
-        // Corrected: row=lane%8/+8, col=lane/8/+4
+        // ---- Normalize output, write LSE and O ----
+        int row0 = mm_row + (lane_id % 8);
+        int row1 = row0 + 8;
+        if (row0 < BLOCK_M) { plan.sM[row0] = rM[0]; plan.sL[row0] = rL[0]; }
+        if (row1 < BLOCK_M) { plan.sM[row1] = rM[1]; plan.sL[row1] = rL[1]; }
+        __syncthreads();
+
+        int max_row = min(params.h_q - start_head_idx, BLOCK_M);
+        float o_scale[2];
+        float attn_sink_val[2] = {0.0f, 0.0f};
+        if (params.attn_sink != nullptr) {
+            if (row0 < params.h_q) attn_sink_val[0] = __ldg((const float*)params.attn_sink + start_head_idx + row0) * (float)M_LOG2E;
+            if (row1 < params.h_q) attn_sink_val[1] = __ldg((const float*)params.attn_sink + start_head_idx + row1) * (float)M_LOG2E;
+        }
+        for (int lr = 0; lr < 2; lr++) {
+            int r = lr == 0 ? row0 : row1;
+            float L = plan.sL[r], M = plan.sM[r];
+            float denom = L + exp2f(attn_sink_val[lr] - M);
+            o_scale[lr] = (L == 0.0f && attn_sink_val[lr] <= M) ? 0.0f : (1.0f / denom);
+            if (batch_idx == 0 && threadIdx.x == 0 && lr == 0) printf("DBG: L=%.6f M=%.6f o_scale=%.6f\n", (float)L, (float)M, (float)o_scale[lr]);
+            for (int i = lr*128; i < lr*128+128; i++) rO[i] *= o_scale[lr];
+        }
+
+        // Write LSE
+        float* gLSE = (float*)params.lse + batch_idx*params.stride_lse_b
+                    + s_q_idx*params.stride_lse_s_q + start_head_idx;
+        if (row0 < max_row) {
+            float L0 = plan.sL[row0], M0 = plan.sM[row0];
+            gLSE[row0] = (L0 == 0.0f) ? INFINITY : (logf(L0) + M0 / (float)M_LOG2E);
+        }
+        if (row1 < max_row) {
+            float L1 = plan.sL[row1], M1 = plan.sM[row1];
+            gLSE[row1] = (L1 == 0.0f) ? INFINITY : (logf(L1) + M1 / (float)M_LOG2E);
+        }
+        __syncthreads();
+
+        // Store output
         bf16* gO = (bf16*)params.out + batch_idx*params.stride_o_b
                  + s_q_idx*params.stride_o_s_q + start_head_idx*params.stride_o_h_q;
-        int max_row = min(params.h_q - start_head_idx, BLOCK_M);
-        int or0 = mm_row + (lane_id % 8);
-        int or1 = or0 + 8;
         for (int ns = 0; ns < HEAD_DIM_V/8; ns++) {
             int ob = ns * 4;
             int oc0 = ns * 8 + (lane_id / 8);
             int oc1 = oc0 + 4;
             if (oc0 < HEAD_DIM_V) {
-                if (or0 < max_row) {
-                    gO[or0 * params.stride_o_h_q + oc0] = (bf16)rO[ob];
-                    gO[or0 * params.stride_o_h_q + oc1] = (bf16)rO[ob + 1];
+                if (row0 < max_row) {
+                    gO[row0 * params.stride_o_h_q + oc0] = (bf16)rO[ob];
+                    gO[row0 * params.stride_o_h_q + oc1] = (bf16)rO[ob + 1];
                 }
-                if (or1 < max_row) {
-                    gO[or1 * params.stride_o_h_q + oc0] = (bf16)rO[ob + 2];
-                    gO[or1 * params.stride_o_h_q + oc1] = (bf16)rO[ob + 3];
+                if (row1 < max_row) {
+                    gO[row1 * params.stride_o_h_q + oc0] = (bf16)rO[ob + 2];
+                    gO[row1 * params.stride_o_h_q + oc1] = (bf16)rO[ob + 3];
                 }
             }
         }

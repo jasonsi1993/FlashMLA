@@ -88,6 +88,10 @@ ext_modules.append(
 
             # sm120 sparse decode (SM80-MMA kernel)
             "csrc/sm120/decode/sparse_fp8/instantiations/v32_h64.cu",
+            "csrc/sm120/decode/sparse_fp8/instantiations/model1_h64.cu",
+
+            # sm120 dense decode (WMMA kernel)
+            "csrc/sm120/decode/dense/splitkv_mla.cu",
 
             # sm90 sparse prefill
             "csrc/sm90/prefill/sparse/fwd.cu",
@@ -126,7 +130,6 @@ ext_modules.append(
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                 "--expt-relaxed-constexpr",
                 "--expt-extended-lambda",
-                "--use_fast_math",
                 "--ptxas-options=-v,--register-usage-level=10,--warn-on-spills,--warn-on-local-memory-usage,--warn-on-double-precision-use",
                 "-lineinfo",
                 "--source-in-ptx",
@@ -138,6 +141,7 @@ ext_modules.append(
             Path(this_dir) / "csrc" / "sm90",
             Path(this_dir) / "csrc" / "cutlass" / "include",
             Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
+            Path("/usr/local/cuda-13.0/targets/x86_64-linux/include/cccl"),
         ],
     )
 )
