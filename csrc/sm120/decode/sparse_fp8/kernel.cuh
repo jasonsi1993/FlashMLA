@@ -111,7 +111,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                             for (int dt = p_start; dt < p_end; dt++) {
                                 int ld = dt - p_start;
                                 if (dt < N_NOPE) {
-                                    #pragma unroll
+                                    #pragma unroll 1  // don't unroll to reduce register pressure
                                     for (int sub = 0; sub < 4; sub++) {
                                         fp8x16 src;
                                         for (int bi=0; bi<8; bi++) {
@@ -128,7 +128,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                                     }
                                 } else {
                                     int rd = dt - N_NOPE;
-                                    #pragma unroll
+                                    #pragma unroll 1  // don't unroll to reduce register pressure
                                     for (int sub = 0; sub < 4; sub++) {
                                         bf16x8 lo, hi;
                                         for (int bi = 0; bi < 8; bi++) {

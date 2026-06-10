@@ -40,12 +40,19 @@ static constexpr int NUM_K_BUFS = 1;
 static constexpr int QK_TILES_PER_PASS = 5;
 static constexpr int NUM_QK_PASSES = (HEAD_DIM_K/64 + QK_TILES_PER_PASS - 1) / QK_TILES_PER_PASS;
 
-// SM80 MMA atom for BF16: 16×8×16 per atom, 4 warps → 4×8=32 atoms serialized
+// SM80 MMA atom for BF16: 16×8×16 per atom, per-warp tiling
+// Each warp processes 16 rows independently; 4 warps cover all 64 heads
 using MMA_Atom = MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>;
-using TiledMMA = decltype(make_tiled_mma(
+// QK: 16 rows × 64 columns per warp (1 M-atom × 8 N-atoms, K=16)
+using TiledMMA_QK = decltype(make_tiled_mma(
     MMA_Atom{},
-    Layout<Shape<_4, _8>>{},   // 4 M-atoms × 8 N-atoms = 32 atoms across 4 warps
-    Tile<_64, _64, _16>{}));   // 64×64 block tile
+    Layout<Shape<_1, _8>>{},   // 1 M-atom × 8 N-atoms = 8 atoms per warp
+    Tile<_16, _64, _16>{}));   // 16×64 output per warp, K=16
+// PV: same MMA atom, used for S×V with 64-column V tiles
+using TiledMMA_PV = decltype(make_tiled_mma(
+    MMA_Atom{},
+    Layout<Shape<_1, _8>>{},   // 1 M-atom × 8 N-atoms per warp
+    Tile<_16, _64, _16>{}));   // same tiling, reused for V-column iteration
 
 // Simple row-major shared memory layouts (no GMMA atoms needed)
 using SmemLayoutQPass = Layout<Shape<Int<BLOCK_M>, Int<QK_TILES_PER_PASS*64>>, Stride<_1, Int<BLOCK_M>>>;
