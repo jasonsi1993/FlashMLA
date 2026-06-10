@@ -488,6 +488,11 @@ sparse_attn_decode_interface(
     params.stride_o_accum_h_q = int64_stride_to_int(o_accum.stride(2));
 
     if (arch.is_sm120f()) {
+        // SM120: sync before kernel launch to ensure metadata kernel and any
+        // prior GPU operations complete. Prevents cross-launch NaN from
+        // CUDA memory allocator reuse/stale shared memory interactions.
+        cudaDeviceSynchronize();
+
         // SM120: use SM80-MMA kernel directly (no GMMA, no split-KV combine needed)
         if (model_type == ModelType::V32) {
             sm120::decode::sparse_fp8::run_sm120_sparse_decode_kernel<ModelType::V32, 64>(params);
