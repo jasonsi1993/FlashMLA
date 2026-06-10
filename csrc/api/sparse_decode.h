@@ -489,15 +489,27 @@ sparse_attn_decode_interface(
 
     if (arch.is_sm120f()) {
         // SM120: sync before kernel launch to ensure metadata kernel and any
-        // prior GPU operations complete. Prevents cross-launch NaN from
-        // CUDA memory allocator reuse/stale shared memory interactions.
+        // prior GPU operations complete.
         cudaDeviceSynchronize();
 
-        // SM120: use SM80-MMA kernel directly (no GMMA, no split-KV combine needed)
-        if (model_type == ModelType::V32) {
-            sm120::decode::sparse_fp8::run_sm120_sparse_decode_kernel<ModelType::V32, 64>(params);
-        } else {
-            sm120::decode::sparse_fp8::run_sm120_sparse_decode_kernel<ModelType::MODEL1, 64>(params);
+        // Split large batches: params.b >= 4 in __grid_constant__ triggers
+        // a CUDA 13 code-generation issue that produces NaN. Work around by
+        // launching at most 2 batches per kernel invocation.
+        static constexpr int SM120_MAX_B = 2;
+        for (int batch_start = 0; batch_start < b; batch_start += SM120_MAX_B) {
+            int cur_b = std::min(SM120_MAX_B, b - batch_start);
+            SparseAttnDecodeParams cur_params = params;
+            cur_params.b = cur_b;
+            cur_params.q += batch_start * params.stride_q_b;
+            cur_params.indices += batch_start * params.stride_indices_b;
+            cur_params.lse += batch_start * params.stride_lse_b;
+            cur_params.out += batch_start * params.stride_o_b;
+
+            if (model_type == ModelType::V32) {
+                sm120::decode::sparse_fp8::run_sm120_sparse_decode_kernel<ModelType::V32, 64>(cur_params);
+            } else {
+                sm120::decode::sparse_fp8::run_sm120_sparse_decode_kernel<ModelType::MODEL1, 64>(cur_params);
+            }
         }
     } else {
         impl->run(params, features);

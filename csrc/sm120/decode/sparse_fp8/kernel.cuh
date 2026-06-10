@@ -42,7 +42,11 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
     }
     __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
 
-    for (int batch_idx = 0; batch_idx < params.b; batch_idx++) {
+    // Read b from params, then immediately hide it from the compiler
+    // to prevent CUDA 13 __grid_constant__ codegen issues for b>=4
+    int num_b = params.b;
+    asm volatile("" : "+r"(num_b) : : "memory");
+    for (int batch_idx = 0; batch_idx < num_b; batch_idx++) {
         float rM[2] = {MAX_INIT_VAL, MAX_INIT_VAL}, rL[2] = {0, 0};
         // O accumulator: 16 rows x 512 cols per warp, 4 floats per 16x8 mma tile = 256 floats/thread
         float rO[256]; for (int i = 0; i < 256; i++) rO[i] = 0.0f;
