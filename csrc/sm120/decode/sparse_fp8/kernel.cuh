@@ -42,15 +42,17 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
     }
     __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
 
-    // Read b from params, then immediately hide it from the compiler
-    // to prevent CUDA 13 __grid_constant__ codegen issues for b>=4
-    int num_b = params.b;
-    asm volatile("" : "+r"(num_b) : : "memory");
-    for (int batch_idx = 0; batch_idx < num_b; batch_idx++) {
+    // Copy hot params to shared memory to avoid __grid_constant__ codegen issues
+    __shared__ int smem_b;
+    __shared__ int smem_topk;
+    if (threadIdx.x == 0) { smem_b = params.b; smem_topk = params.topk; }
+    __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
+
+    for (int batch_idx = 0; batch_idx < smem_b; batch_idx++) {
         float rM[2] = {MAX_INIT_VAL, MAX_INIT_VAL}, rL[2] = {0, 0};
         // O accumulator: 16 rows x 512 cols per warp, 4 floats per 16x8 mma tile = 256 floats/thread
         float rO[256]; for (int i = 0; i < 256; i++) rO[i] = 0.0f;
-        int total_blocks = params.topk / TOPK_BLOCK_SIZE;
+        int total_blocks = smem_topk / TOPK_BLOCK_SIZE;
         for (int block_idx = 0; block_idx < total_blocks; block_idx++) {
             // is_kv_valid -- SHARED memory so ALL threads can read ALL entries
             int* gIdx = params.indices + batch_idx*params.stride_indices_b
