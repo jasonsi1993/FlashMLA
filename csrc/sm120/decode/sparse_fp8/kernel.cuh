@@ -40,7 +40,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
     for (int i = threadIdx.x; i < sizeof(SharedMemoryPlan)/4; i += NUM_THREADS) {
         ((int*)wksp_buf)[i] = 0;
     }
-    __syncthreads();
+    __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
 
     for (int batch_idx = 0; batch_idx < params.b; batch_idx++) {
         float rM[2] = {MAX_INIT_VAL, MAX_INIT_VAL}, rL[2] = {0, 0};
@@ -53,7 +53,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                        + s_q_idx*params.stride_indices_s_q + block_idx*TOPK_BLOCK_SIZE;
             for (int i = threadIdx.x; i < TOPK_BLOCK_SIZE; i += NUM_THREADS)
                 plan.is_kv_valid[i] = (__ldg(gIdx + i) != -1);
-            __syncthreads();
+            __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
 
             // rP: 64 floats per thread for QK(16x64): 64/8=8 N-steps x 8 vals = 64?
             // Actually each mma.sync produces 4 floats per thread covering 16x8.
@@ -75,7 +75,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                     int r = i / p_dim, c = i % p_dim;
                     plan.q.data()[i] = gQp[r * params.stride_q_h_q + c];
                 }
-                __syncthreads();
+                __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
 
                 // K dequant from FP8 cache: see sparse_fp8/../splitkv_mla.cuh producer for reference
                 {
@@ -111,28 +111,34 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                             for (int dt = p_start; dt < p_end; dt++) {
                                 int ld = dt - p_start;
                                 if (dt < N_NOPE) {
-                                    fp8x16 src;
-                                    for (int bi=0; bi<8; bi++) {
-                                        ((uint8_t*)&src.lo)[bi] = gK[dt*64 + bi];
-                                        ((uint8_t*)&src.hi)[bi] = gK[dt*64 + 8 + bi];
-                                    }
-                                    bf16 sc = (bf16)sf[MODEL_TYPE==ModelType::V32 ? dt/2 : dt];
-                                    bf16x8 lo = cvt_fp8x8_bf16x8(src.lo, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
-                                    bf16x8 hi = cvt_fp8x8_bf16x8(src.hi, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
-                                    for (int bi = 0; bi < 8; bi++) {
-                                        row[ld*64 + bi] = ((bf16*)&lo)[bi];
-                                        row[ld*64 + 8 + bi] = ((bf16*)&hi)[bi];
+                                    #pragma unroll
+                                    for (int sub = 0; sub < 4; sub++) {
+                                        fp8x16 src;
+                                        for (int bi=0; bi<8; bi++) {
+                                            ((uint8_t*)&src.lo)[bi] = gK[dt*64 + sub*16 + bi];
+                                            ((uint8_t*)&src.hi)[bi] = gK[dt*64 + sub*16 + 8 + bi];
+                                        }
+                                        bf16 sc = (bf16)sf[MODEL_TYPE==ModelType::V32 ? dt/2 : dt];
+                                        bf16x8 lo = cvt_fp8x8_bf16x8(src.lo, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
+                                        bf16x8 hi = cvt_fp8x8_bf16x8(src.hi, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
+                                        for (int bi = 0; bi < 8; bi++) {
+                                            row[ld*64 + sub*16 + bi] = ((bf16*)&lo)[bi];
+                                            row[ld*64 + sub*16 + 8 + bi] = ((bf16*)&hi)[bi];
+                                        }
                                     }
                                 } else {
                                     int rd = dt - N_NOPE;
-                                    bf16x8 lo, hi;
-                                    for (int bi = 0; bi < 8; bi++) {
-                                        ((bf16*)&lo)[bi] = gK_rope[rd*64 + bi];
-                                        ((bf16*)&hi)[bi] = gK_rope[rd*64 + 8 + bi];
-                                    }
-                                    for (int bi = 0; bi < 8; bi++) {
-                                        row[ld*64 + bi] = ((bf16*)&lo)[bi];
-                                        row[ld*64 + 8 + bi] = ((bf16*)&hi)[bi];
+                                    #pragma unroll
+                                    for (int sub = 0; sub < 4; sub++) {
+                                        bf16x8 lo, hi;
+                                        for (int bi = 0; bi < 8; bi++) {
+                                            ((bf16*)&lo)[bi] = gK_rope[rd*64 + sub*16 + bi];
+                                            ((bf16*)&hi)[bi] = gK_rope[rd*64 + sub*16 + 8 + bi];
+                                        }
+                                        for (int bi = 0; bi < 8; bi++) {
+                                            row[ld*64 + sub*16 + bi] = ((bf16*)&lo)[bi];
+                                            row[ld*64 + sub*16 + 8 + bi] = ((bf16*)&hi)[bi];
+                                        }
                                     }
                                 }
                             }
@@ -141,7 +147,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                         }
                     }
                 }
-                __syncthreads();
+                __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
 
                 // Manual mma.sync QK loop
                 bf16* sQ_ptr = plan.q.data();
@@ -182,7 +188,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                         rP[pb]=c[0]; rP[pb+1]=c[1]; rP[pb+2]=c[2]; rP[pb+3]=c[3];
                     }
                 }
-                __syncthreads();
+                __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
             }  // QK passes
 
             // ---- Online softmax ----
@@ -244,7 +250,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                     sS_ptr[sr1 * TOPK_BLOCK_SIZE + sc1] = (bf16)rP[pb + 3];
                 }
             }
-            __syncthreads();
+            __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
 
             // ---- PV: S x V -> O ----
             for (int vh = 0; vh < 2; vh++) {
@@ -308,7 +314,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                         }
                     }
                 }
-                __syncthreads();
+                __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
 
                 // Manual mma.sync PV loop: S[16x64] x V[64x256] -> O[16x256]
                 bf16* sS_ptr2 = plan.s.data();
@@ -349,7 +355,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                         rO[ob]=c[0]; rO[ob+1]=c[1]; rO[ob+2]=c[2]; rO[ob+3]=c[3];
                     }
                 }
-                __syncthreads();
+                __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
             }
         }  // K/V blocks
 
@@ -358,7 +364,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
         int row1 = row0 + 8;
         if (row0 < BLOCK_M) { plan.sM[row0] = rM[0]; plan.sL[row0] = rL[0]; }
         if (row1 < BLOCK_M) { plan.sM[row1] = rM[1]; plan.sL[row1] = rL[1]; }
-        __syncthreads();
+        __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
 
         int max_row = min(params.h_q - start_head_idx, BLOCK_M);
         float o_scale[2];
@@ -390,7 +396,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
             float L1 = plan.sL[row1], M1 = plan.sM[row1];
             gLSE[row1] = (L1 == 0.0f) ? INFINITY : (logf(L1) + M1 / (float)M_LOG2E);
         }
-        __syncthreads();
+        __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
 
         // Store output
         bf16* gO = (bf16*)params.out + batch_idx*params.stride_o_b
@@ -410,7 +416,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                 }
             }
         }
-        __syncthreads();
+        __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
     }
 #endif
 }  // devfunc
