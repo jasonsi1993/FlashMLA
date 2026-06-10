@@ -14,6 +14,81 @@ using fp8_e8m0 = __nv_fp8_e8m0;
 
 static constexpr float MAX_INIT_VAL = -1e30;
 
+// Isolated QK MMA: takes only pointers it needs, no params struct visibility
+static __device__ __noinline__
+void qk_mma_kernel(bf16* sQ_ptr, bf16* sK_ptr, float* rP,
+                   int p_dim, int topk_blocks, int lane_id, int mm_row) {
+    for (int ks = 0; ks < p_dim/16; ks++) {
+        unsigned a_regs[4];
+        int ar0 = lane_id % 8, ar1 = ar0 + 8;
+        int a_col = (lane_id / 8) * 4;
+        for (int g = 0; g < 2; g++) {
+            int r = (g == 0 ? ar0 : ar1);
+            bf16* a_src = sQ_ptr + (mm_row+r)*p_dim + ks*16;
+            ((bf16*)&a_regs[g*2])[0]   = a_src[a_col];
+            ((bf16*)&a_regs[g*2])[1]   = a_src[a_col + 1];
+            ((bf16*)&a_regs[g*2+1])[0] = a_src[a_col + 8];
+            ((bf16*)&a_regs[g*2+1])[1] = a_src[a_col + 9];
+        }
+        for (int ns = 0; ns < topk_blocks/8; ns++) {
+            unsigned b_regs[2];
+            int bk0 = lane_id % 8, bk1 = bk0 + 8;
+            int bn0 = lane_id / 8, bn1 = bn0 + 4;
+            ((bf16*)&b_regs[0])[0] = sK_ptr[(ns*8+bn0)*p_dim + ks*16 + bk0];
+            ((bf16*)&b_regs[0])[1] = sK_ptr[(ns*8+bn0)*p_dim + ks*16 + bk0 + 1];
+            ((bf16*)&b_regs[1])[0] = sK_ptr[(ns*8+bn1)*p_dim + ks*16 + bk1];
+            ((bf16*)&b_regs[1])[1] = sK_ptr[(ns*8+bn1)*p_dim + ks*16 + bk1 + 1];
+            float c[4]; int pb = ns * 4;
+            c[0]=rP[pb]; c[1]=rP[pb+1]; c[2]=rP[pb+2]; c[3]=rP[pb+3];
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                : "r"(a_regs[0]), "r"(a_regs[1]), "r"(a_regs[2]), "r"(a_regs[3]),
+                  "r"(b_regs[0]), "r"(b_regs[1]));
+            rP[pb]=c[0]; rP[pb+1]=c[1]; rP[pb+2]=c[2]; rP[pb+3]=c[3];
+        }
+    }
+}
+
+// Isolated PV MMA: takes only pointers it needs
+static __device__ __noinline__
+void pv_mma_kernel(bf16* sS_ptr, bf16* sV_ptr, float* rO,
+                   int hv, int topk_blocks, int vh, int lane_id, int mm_row) {
+    for (int ks = 0; ks < topk_blocks/16; ks++) {
+        unsigned a_regs[4];
+        int ar0 = lane_id % 8, ar1 = ar0 + 8;
+        int a_col = (lane_id / 8) * 4;
+        for (int g = 0; g < 2; g++) {
+            int r = (g==0 ? ar0 : ar1);
+            bf16* a_src = sS_ptr + (mm_row+r)*topk_blocks + ks*16;
+            ((bf16*)&a_regs[g*2])[0]   = a_src[a_col];
+            ((bf16*)&a_regs[g*2])[1]   = a_src[a_col + 1];
+            ((bf16*)&a_regs[g*2+1])[0] = a_src[a_col + 8];
+            ((bf16*)&a_regs[g*2+1])[1] = a_src[a_col + 9];
+        }
+        for (int ns = 0; ns < hv/8; ns++) {
+            unsigned b_regs[2];
+            int bk0 = lane_id % 8, bk1 = bk0 + 8;
+            int bn0 = lane_id / 8, bn1 = bn0 + 4;
+            ((bf16*)&b_regs[0])[0] = sV_ptr[(ks*16 + bk0)*hv + (ns*8+bn0)];
+            ((bf16*)&b_regs[0])[1] = sV_ptr[(ks*16 + bk0 + 1)*hv + (ns*8+bn0)];
+            ((bf16*)&b_regs[1])[0] = sV_ptr[(ks*16 + bk1)*hv + (ns*8+bn1)];
+            ((bf16*)&b_regs[1])[1] = sV_ptr[(ks*16 + bk1 + 1)*hv + (ns*8+bn1)];
+            int ob = ns * 4 + vh * 128;
+            float c[4];
+            c[0]=rO[ob]; c[1]=rO[ob+1]; c[2]=rO[ob+2]; c[3]=rO[ob+3];
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                : "r"(a_regs[0]), "r"(a_regs[1]), "r"(a_regs[2]), "r"(a_regs[3]),
+                  "r"(b_regs[0]), "r"(b_regs[1]));
+            rO[ob]=c[0]; rO[ob+1]=c[1]; rO[ob+2]=c[2]; rO[ob+3]=c[3];
+        }
+    }
+}
+
 template<ModelType MODEL_TYPE, int NUM_HEADS>
 template<typename TMAParams>
 __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
@@ -155,45 +230,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                 }
                 __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
 
-                // Manual mma.sync QK loop
-                bf16* sQ_ptr = plan.q.data();
-                bf16* sK_ptr = plan.k.data();
-
-                for (int ks = 0; ks < p_dim/16; ks++) {
-                    unsigned a_regs[4];
-                    int ar0 = lane_id % 8, ar1 = ar0 + 8;
-                    int a_col = (lane_id / 8) * 4;
-                    for (int g = 0; g < 2; g++) {
-                        int r = (g == 0 ? ar0 : ar1);
-                        bf16* a_src = sQ_ptr + (mm_row+r)*p_dim + ks*16;
-                        // MMA A register: 4 pairs = (col, col+1), (col+8, col+9)
-                        // repeated for each of 2 row groups
-                        ((bf16*)&a_regs[g*2])[0]   = a_src[a_col];
-                        ((bf16*)&a_regs[g*2])[1]   = a_src[a_col + 1];
-                        ((bf16*)&a_regs[g*2+1])[0] = a_src[a_col + 8];
-                        ((bf16*)&a_regs[g*2+1])[1] = a_src[a_col + 9];
-                    }
-                    for (int ns = 0; ns < TOPK_BLOCK_SIZE/8; ns++) {
-                        unsigned b_regs[2];
-                        // B is (K=16, N=8): thread loads K-rows [lane%8, lane%8+8], N-cols [lane/8, lane/8+4]
-                        int bk0 = lane_id % 8, bk1 = bk0 + 8;
-                        int bn0 = lane_id / 8, bn1 = bn0 + 4;
-                        ((bf16*)&b_regs[0])[0] = sK_ptr[(ns*8+bn0)*p_dim + ks*16 + bk0];
-                        ((bf16*)&b_regs[0])[1] = sK_ptr[(ns*8+bn0)*p_dim + ks*16 + bk0 + 1];
-                        ((bf16*)&b_regs[1])[0] = sK_ptr[(ns*8+bn1)*p_dim + ks*16 + bk1];
-                        ((bf16*)&b_regs[1])[1] = sK_ptr[(ns*8+bn1)*p_dim + ks*16 + bk1 + 1];
-
-                        float c[4]; int pb = ns * 4;
-                        c[0]=rP[pb]; c[1]=rP[pb+1]; c[2]=rP[pb+2]; c[3]=rP[pb+3];
-                        asm volatile(
-                            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                            : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                            : "r"(a_regs[0]), "r"(a_regs[1]), "r"(a_regs[2]), "r"(a_regs[3]),
-                              "r"(b_regs[0]), "r"(b_regs[1]));
-                        rP[pb]=c[0]; rP[pb+1]=c[1]; rP[pb+2]=c[2]; rP[pb+3]=c[3];
-                    }
-                }
+                // QK MMA via isolated __noinline__ function (no params visibility)
+                qk_mma_kernel(plan.q.data(), plan.k.data(), rP,
+                              p_dim, TOPK_BLOCK_SIZE, lane_id, mm_row);
                 __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
             }  // QK passes
 
@@ -322,45 +361,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                 }
                 __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
 
-                // Manual mma.sync PV loop: S[16x64] x V[64x256] -> O[16x256]
-                bf16* sS_ptr2 = plan.s.data();
-                bf16* sV_ptr = plan.k.data();
-
-                for (int ks = 0; ks < TOPK_BLOCK_SIZE/16; ks++) {
-                    // Load A: S[mm:16, ks*16:(ks+1)*16], row=lane%8/+8, col=(lane/8)*4
-                    unsigned a_regs[4];
-                    int ar0 = lane_id % 8, ar1 = ar0 + 8;
-                    int a_col = (lane_id / 8) * 4;
-                    for (int g = 0; g < 2; g++) {
-                        int r = (g==0 ? ar0 : ar1);
-                        bf16* a_src = sS_ptr2 + (mm_row+r)*TOPK_BLOCK_SIZE + ks*16;
-                        ((bf16*)&a_regs[g*2])[0]   = a_src[a_col];
-                        ((bf16*)&a_regs[g*2])[1]   = a_src[a_col + 1];
-                        ((bf16*)&a_regs[g*2+1])[0] = a_src[a_col + 8];
-                        ((bf16*)&a_regs[g*2+1])[1] = a_src[a_col + 9];
-                    }
-                    for (int ns = 0; ns < HV/8; ns++) {
-                        unsigned b_regs[2];
-                        int bk0 = lane_id % 8, bk1 = bk0 + 8;
-                        int bn0 = lane_id / 8, bn1 = bn0 + 4;
-                        ((bf16*)&b_regs[0])[0] = sV_ptr[(ks*16 + bk0)*HV + (ns*8+bn0)];
-                        ((bf16*)&b_regs[0])[1] = sV_ptr[(ks*16 + bk0 + 1)*HV + (ns*8+bn0)];
-                        ((bf16*)&b_regs[1])[0] = sV_ptr[(ks*16 + bk1)*HV + (ns*8+bn1)];
-                        ((bf16*)&b_regs[1])[1] = sV_ptr[(ks*16 + bk1 + 1)*HV + (ns*8+bn1)];
-
-                        // 4 outputs per N-step, 128 per V-half -> 256 total per thread
-                        int ob = ns * 4 + vh * 128;
-                        float c[4];
-                        c[0]=rO[ob]; c[1]=rO[ob+1]; c[2]=rO[ob+2]; c[3]=rO[ob+3];
-                        asm volatile(
-                            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                            : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                            : "r"(a_regs[0]), "r"(a_regs[1]), "r"(a_regs[2]), "r"(a_regs[3]),
-                              "r"(b_regs[0]), "r"(b_regs[1]));
-                        rO[ob]=c[0]; rO[ob+1]=c[1]; rO[ob+2]=c[2]; rO[ob+3]=c[3];
-                    }
-                }
+                // PV MMA via isolated __noinline__ function (no params visibility)
+                pv_mma_kernel(plan.s.data(), plan.k.data(), rO,
+                              HV, TOPK_BLOCK_SIZE, vh, lane_id, mm_row);
                 __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
             }
         }  // K/V blocks
