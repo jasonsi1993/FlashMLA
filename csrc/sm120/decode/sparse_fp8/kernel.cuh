@@ -146,14 +146,41 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
         float rM[2] = {MAX_INIT_VAL, MAX_INIT_VAL}, rL[2] = {0, 0};
         // O accumulator: 16 rows x 512 cols per warp, 4 floats per 16x8 mma tile = 256 floats/thread
         float rO[256]; for (int i = 0; i < 256; i++) rO[i] = 0.0f;
-        int total_blocks = smem_topk / TOPK_BLOCK_SIZE;
-        for (int block_idx = 0; block_idx < total_blocks; block_idx++) {
-            // is_kv_valid -- SHARED memory so ALL threads can read ALL entries
-            int* gIdx = params.indices + batch_idx*params.stride_indices_b
-                       + s_q_idx*params.stride_indices_s_q + block_idx*TOPK_BLOCK_SIZE;
-            for (int i = threadIdx.x; i < TOPK_BLOCK_SIZE; i += NUM_THREADS)
-                plan.is_kv_valid[i] = (__ldg(gIdx + i) != -1);
-            __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
+        int num_scopes = (params.extra_kv != nullptr) ? 2 : 1;
+        for (int scope_idx = 0; scope_idx < num_scopes; scope_idx++) {
+            const bool is_extra_scope = (scope_idx != 0);
+            int scope_topk = is_extra_scope ? params.extra_topk : smem_topk;
+            int scope_topk_length = scope_topk;
+            if (is_extra_scope) {
+                if (params.extra_topk_length != nullptr) {
+                    scope_topk_length = __ldg(params.extra_topk_length + batch_idx);
+                }
+            } else if (params.topk_length != nullptr) {
+                scope_topk_length = __ldg(params.topk_length + batch_idx);
+            }
+            scope_topk_length = min(scope_topk_length, scope_topk);
+
+            int* scope_indices = is_extra_scope ? params.extra_indices : params.indices;
+            int scope_stride_indices_b = is_extra_scope ? params.stride_extra_indices_b : params.stride_indices_b;
+            int scope_stride_indices_s_q = is_extra_scope ? params.stride_extra_indices_s_q : params.stride_indices_s_q;
+            fp8* scope_kv = (fp8*)(is_extra_scope ? params.extra_kv : params.kv);
+            int scope_stride_kv_block = is_extra_scope ? params.stride_extra_kv_block : params.stride_kv_block;
+            int scope_stride_kv_row = is_extra_scope ? params.stride_extra_kv_row : params.stride_kv_row;
+            int scope_page_block_size = is_extra_scope ? params.extra_page_block_size : params.page_block_size;
+
+            int total_blocks = (scope_topk + TOPK_BLOCK_SIZE - 1) / TOPK_BLOCK_SIZE;
+            for (int block_idx = 0; block_idx < total_blocks; block_idx++) {
+                // is_kv_valid -- SHARED memory so ALL threads can read ALL entries.
+                // Dynamic top-k length masks entries past topk_length; those entries may
+                // contain arbitrary values and must not participate in QK, softmax, or PV.
+                int* gIdx = scope_indices + batch_idx*scope_stride_indices_b
+                           + s_q_idx*scope_stride_indices_s_q + block_idx*TOPK_BLOCK_SIZE;
+                for (int i = threadIdx.x; i < TOPK_BLOCK_SIZE; i += NUM_THREADS) {
+                    int topk_pos = block_idx * TOPK_BLOCK_SIZE + i;
+                    int tok = (topk_pos < scope_topk) ? __ldg(gIdx + i) : -1;
+                    plan.is_kv_valid[i] = (topk_pos < scope_topk_length) && (tok != -1);
+                }
+                __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
 
             // rP: 64 floats per thread for QK(16x64): 64/8=8 N-steps x 8 vals = 64?
             // Actually each mma.sync produces 4 floats per thread covering 16x8.
@@ -181,23 +208,26 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                 {
                     int toff = block_idx * TOPK_BLOCK_SIZE;
                     for (int t = threadIdx.x; t < TOPK_BLOCK_SIZE; t += NUM_THREADS) {
-                        int tok = __ldg(params.indices + batch_idx*params.stride_indices_b
-                                       + s_q_idx*params.stride_indices_s_q + toff + t);
+                        int topk_pos = toff + t;
+                        int tok = (topk_pos < scope_topk_length)
+                            ? __ldg(scope_indices + batch_idx*scope_stride_indices_b
+                                    + s_q_idx*scope_stride_indices_s_q + topk_pos)
+                            : -1;
                         static constexpr int TSTRIDE = (MODEL_TYPE == ModelType::V32)
                             ? 0 : (HEAD_DIM_NOPE + 2 * HEAD_DIM_ROPE);
-                        const int rs = (MODEL_TYPE == ModelType::V32) ? params.stride_kv_row : TSTRIDE;
+                        const int rs = (MODEL_TYPE == ModelType::V32) ? scope_stride_kv_row : TSTRIDE;
                         bf16* row = plan.k.data() + t * p_dim;
                         if (tok != -1) {
-                            int blk = tok / params.page_block_size;
-                            int rel = tok % params.page_block_size;
-                            fp8* gK = (fp8*)params.kv + blk*params.stride_kv_block + rel*rs;
+                            int blk = tok / scope_page_block_size;
+                            int rel = tok % scope_page_block_size;
+                            fp8* gK = scope_kv + blk*scope_stride_kv_block + rel*rs;
                             union { float sf_f32[4]; bf16 sf_bf16[8]; } sf_union;
                             if constexpr (MODEL_TYPE == ModelType::V32) {
                                 for (int si=0; si<4; si++)
                                     sf_union.sf_f32[si] = __ldg((const float*)(gK + HEAD_DIM_NOPE) + si);
                             } else {
-                                uint8_t* bsc = (uint8_t*)((fp8*)params.kv + blk*params.stride_kv_block)
-                                             + params.page_block_size * TSTRIDE;
+                                uint8_t* bsc = (uint8_t*)(scope_kv + blk*scope_stride_kv_block)
+                                             + scope_page_block_size * TSTRIDE;
                                 fp8_e8m0* se8 = (fp8_e8m0*)(bsc + rel * NUM_SCALES);
                                 for (int si=0; si<NUM_SCALES; si+=2) {
                                     __nv_bfloat162_raw raw = __nv_cvt_e8m0x2_to_bf162raw(*(__nv_fp8x2_storage_t*)(se8+si));
@@ -363,22 +393,25 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                 {
                     int toff = block_idx * TOPK_BLOCK_SIZE;
                     for (int t = threadIdx.x; t < TOPK_BLOCK_SIZE; t += NUM_THREADS) {
-                        int tok = __ldg(params.indices + batch_idx*params.stride_indices_b
-                                       + s_q_idx*params.stride_indices_s_q + toff + t);
+                        int topk_pos = toff + t;
+                        int tok = (topk_pos < scope_topk_length)
+                            ? __ldg(scope_indices + batch_idx*scope_stride_indices_b
+                                    + s_q_idx*scope_stride_indices_s_q + topk_pos)
+                            : -1;
                         bf16* vrow = plan.k.data() + t * HV;
                         if (tok != -1) {
-                            int blk = tok / params.page_block_size;
-                            int rel = tok % params.page_block_size;
+                            int blk = tok / scope_page_block_size;
+                            int rel = tok % scope_page_block_size;
                             static constexpr int TSV = (MODEL_TYPE == ModelType::V32) ? 0 : (HEAD_DIM_NOPE + 2 * HEAD_DIM_ROPE);
-                            const int rsv = (MODEL_TYPE == ModelType::V32) ? params.stride_kv_row : TSV;
-                            fp8* gK = (fp8*)params.kv + blk*params.stride_kv_block + rel*rsv;
+                            const int rsv = (MODEL_TYPE == ModelType::V32) ? scope_stride_kv_row : TSV;
+                            fp8* gK = scope_kv + blk*scope_stride_kv_block + rel*rsv;
                             union { float sf_f32[4]; bf16 sf_bf16[8]; } sf_union_v;
                             if constexpr (MODEL_TYPE==ModelType::V32)
                                 for (int si=0; si<4; si++) sf_union_v.sf_f32[si] = ((const float*)(gK + HEAD_DIM_NOPE))[si];
                             else {
                                 static constexpr int TS2 = HEAD_DIM_NOPE + 2 * HEAD_DIM_ROPE;
-                                uint8_t* bsc2 = (uint8_t*)((fp8*)params.kv + blk*params.stride_kv_block)
-                                               + params.page_block_size * TS2;
+                                uint8_t* bsc2 = (uint8_t*)(scope_kv + blk*scope_stride_kv_block)
+                                               + scope_page_block_size * TS2;
                                 fp8_e8m0* se2 = (fp8_e8m0*)(bsc2 + rel * NUM_SCALES);
                                 for (int si=0; si<NUM_SCALES; si+=2) {
                                     __nv_bfloat162_raw raw = __nv_cvt_e8m0x2_to_bf162raw(*(__nv_fp8x2_storage_t*)(se2+si));
@@ -429,7 +462,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                               HV, TOPK_BLOCK_SIZE, vh, lane_id, mm_row);
                 __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
             }
-        }  // K/V blocks
+            }  // K/V blocks
+        }  // main/extra KV scopes
 
         // ---- Normalize output, write LSE and O ----
         int row0 = mm_row + (lane_id % 8);
@@ -473,31 +507,11 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                     + s_q_idx*params.stride_lse_s_q + start_head_idx;
         if (row0 < max_row) {
             float L0 = plan.sL[row0], M0 = plan.sM[row0];
-            if (has_sink) {
-                float sink0 = __ldg((const float*)params.attn_sink + start_head_idx + row0) * (float)M_LOG2E;
-                if (!isfinite(sink0)) {
-                    gLSE[row0] = (L0 == 0.0f) ? INFINITY : (logf(L0) + M0 / (float)M_LOG2E);
-                } else {
-                    float denom = L0 + exp2f(sink0 - M0);
-                    gLSE[row0] = (denom == 0.0f) ? INFINITY : (logf(denom) + M0 / (float)M_LOG2E);
-                }
-            } else {
-                gLSE[row0] = (L0 == 0.0f) ? INFINITY : (logf(L0) + M0 / (float)M_LOG2E);
-            }
+            gLSE[row0] = (L0 == 0.0f) ? INFINITY : (logf(L0) + M0 / (float)M_LOG2E);
         }
         if (row1 < max_row) {
             float L1 = plan.sL[row1], M1 = plan.sM[row1];
-            if (has_sink) {
-                float sink1 = __ldg((const float*)params.attn_sink + start_head_idx + row1) * (float)M_LOG2E;
-                if (!isfinite(sink1)) {
-                    gLSE[row1] = (L1 == 0.0f) ? INFINITY : (logf(L1) + M1 / (float)M_LOG2E);
-                } else {
-                    float denom = L1 + exp2f(sink1 - M1);
-                    gLSE[row1] = (denom == 0.0f) ? INFINITY : (logf(denom) + M1 / (float)M_LOG2E);
-                }
-            } else {
-                gLSE[row1] = (L1 == 0.0f) ? INFINITY : (logf(L1) + M1 / (float)M_LOG2E);
-            }
+            gLSE[row1] = (L1 == 0.0f) ? INFINITY : (logf(L1) + M1 / (float)M_LOG2E);
         }
         __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
 
