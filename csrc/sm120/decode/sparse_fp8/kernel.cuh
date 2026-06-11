@@ -34,10 +34,12 @@ void qk_mma_kernel(bf16* sQ_ptr, bf16* sK_ptr, float* rP,
             unsigned b_regs[2];
             int bk0 = lane_id % 8, bk1 = bk0 + 8;
             int bn0 = lane_id / 8, bn1 = bn0 + 4;
+            // b_regs[0]: same K-row (bk0), two N-columns (bn0, bn1)
+            // b_regs[1]: same K-row (bk1), two N-columns (bn0, bn1)
             ((bf16*)&b_regs[0])[0] = sK_ptr[(ns*8+bn0)*p_dim + ks*16 + bk0];
-            ((bf16*)&b_regs[0])[1] = sK_ptr[(ns*8+bn0)*p_dim + ks*16 + bk0 + 1];
-            ((bf16*)&b_regs[1])[0] = sK_ptr[(ns*8+bn1)*p_dim + ks*16 + bk1];
-            ((bf16*)&b_regs[1])[1] = sK_ptr[(ns*8+bn1)*p_dim + ks*16 + bk1 + 1];
+            ((bf16*)&b_regs[0])[1] = sK_ptr[(ns*8+bn1)*p_dim + ks*16 + bk0];
+            ((bf16*)&b_regs[1])[0] = sK_ptr[(ns*8+bn0)*p_dim + ks*16 + bk1];
+            ((bf16*)&b_regs[1])[1] = sK_ptr[(ns*8+bn1)*p_dim + ks*16 + bk1];
             float c[4]; int pb = ns * 4;
             c[0]=rP[pb]; c[1]=rP[pb+1]; c[2]=rP[pb+2]; c[3]=rP[pb+3];
             asm volatile(
@@ -71,10 +73,12 @@ void pv_mma_kernel(bf16* sS_ptr, bf16* sV_ptr, float* rO,
             unsigned b_regs[2];
             int bk0 = lane_id % 8, bk1 = bk0 + 8;
             int bn0 = lane_id / 8, bn1 = bn0 + 4;
+            // b_regs[0]: same K-row (bk0), two N-columns (bn0, bn1)
+            // b_regs[1]: same K-row (bk1), two N-columns (bn0, bn1)
             ((bf16*)&b_regs[0])[0] = sV_ptr[(ks*16 + bk0)*hv + (ns*8+bn0)];
-            ((bf16*)&b_regs[0])[1] = sV_ptr[(ks*16 + bk0 + 1)*hv + (ns*8+bn0)];
-            ((bf16*)&b_regs[1])[0] = sV_ptr[(ks*16 + bk1)*hv + (ns*8+bn1)];
-            ((bf16*)&b_regs[1])[1] = sV_ptr[(ks*16 + bk1 + 1)*hv + (ns*8+bn1)];
+            ((bf16*)&b_regs[0])[1] = sV_ptr[(ks*16 + bk0)*hv + (ns*8+bn1)];
+            ((bf16*)&b_regs[1])[0] = sV_ptr[(ks*16 + bk1)*hv + (ns*8+bn0)];
+            ((bf16*)&b_regs[1])[1] = sV_ptr[(ks*16 + bk1)*hv + (ns*8+bn1)];
             int ob = ns * 4 + vh * 128;
             float c[4];
             c[0]=rO[ob]; c[1]=rO[ob+1]; c[2]=rO[ob+2]; c[3]=rO[ob+3];
