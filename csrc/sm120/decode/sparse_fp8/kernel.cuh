@@ -176,17 +176,21 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                             int blk = tok / params.page_block_size;
                             int rel = tok % params.page_block_size;
                             fp8* gK = (fp8*)params.kv + blk*params.stride_kv_block + rel*rs;
-                            float sf[NUM_SCALES];
+                            union { float sf_f32[4]; bf16 sf_bf16[8]; } sf_union;
                             if constexpr (MODEL_TYPE == ModelType::V32) {
                                 for (int si=0; si<4; si++)
-                                    sf[si] = __ldg((const float*)(gK + HEAD_DIM_NOPE) + si);
+                                    sf_union.sf_f32[si] = __ldg((const float*)(gK + HEAD_DIM_NOPE) + si);
                             } else {
                                 uint8_t* bsc = (uint8_t*)((fp8*)params.kv + blk*params.stride_kv_block)
                                              + params.page_block_size * TSTRIDE;
                                 fp8_e8m0* se8 = (fp8_e8m0*)(bsc + rel * NUM_SCALES);
-                                for (int si=0; si<NUM_SCALES; si+=2)
-                                    *(__nv_bfloat162_raw*)(sf+si) = __nv_cvt_e8m0x2_to_bf162raw(*(__nv_fp8x2_storage_t*)(se8+si));
+                                for (int si=0; si<NUM_SCALES; si+=2) {
+                                    __nv_bfloat162_raw raw = __nv_cvt_e8m0x2_to_bf162raw(*(__nv_fp8x2_storage_t*)(se8+si));
+                                    *reinterpret_cast<__nv_bfloat162_raw*>(sf_union.sf_bf16 + si) = raw;
+                                }
                             }
+                            float* sf = sf_union.sf_f32;  // for V32 access via sf[idx]
+                            bf16* sf_b = sf_union.sf_bf16;  // for MODEL1 access via sf_b[idx]
 
                             static constexpr int N_NOPE = HEAD_DIM_NOPE / 64;
                             bf16* gK_rope = (MODEL_TYPE == ModelType::V32)
@@ -203,7 +207,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                                             ((uint8_t*)&src.lo)[bi] = gK[dt*64 + sub*16 + bi];
                                             ((uint8_t*)&src.hi)[bi] = gK[dt*64 + sub*16 + 8 + bi];
                                         }
-                                        bf16 sc = (bf16)sf[MODEL_TYPE==ModelType::V32 ? dt/2 : dt];
+                                        bf16 sc = (MODEL_TYPE == ModelType::V32) ? (bf16)sf[dt/2] : sf_b[dt];
                                         bf16x8 lo = cvt_fp8x8_bf16x8(src.lo, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
                                         bf16x8 hi = cvt_fp8x8_bf16x8(src.hi, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
                                         for (int bi = 0; bi < 8; bi++) {
@@ -242,12 +246,15 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
 
             // ---- Online softmax ----
             // rP layout: ns*4+0/1 = row group 0, ns*4+2/3 = row group 1
-            // Columns: ns*8 + lane/8 (col0), ns*8 + lane/8 + 4 (col1)
+            // rO layout: interleaved per MMA tile:
+            //   rO[vh*128 + ns*4 + 0] = row0, rO[vh*128 + ns*4 + 1] = row0
+            //   rO[vh*128 + ns*4 + 2] = row1, rO[vh*128 + ns*4 + 3] = row1
             {
                 float scale_old[2];
+                // Phase 1: compute new max and scale_old for both rows
                 for (int lr = 0; lr < 2; lr++) {
                     float cm = -INFINITY;
-                    int pb_base = lr * 2;  // offset within 4-entry group for this row
+                    int pb_base = lr * 2;
                     for (int ns = 0; ns < TOPK_BLOCK_SIZE/8; ns++) {
                         int pb = ns*4 + pb_base;
                         int col0 = ns*8 + c_col0, col1 = col0 + 4;
@@ -259,8 +266,21 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                     cm *= params.sm_scale_div_log2;
                     float om = rM[lr]; rM[lr] = fmaxf(cm, om);
                     scale_old[lr] = exp2f(om - rM[lr]);
-                    for (int i = lr*128; i < lr*128+128; i++) rO[i] *= scale_old[lr];
-
+                }
+                // Phase 2: rescale rO with correct interleaved layout
+                for (int vh_i = 0; vh_i < 2; vh_i++) {
+                    int vh_base = vh_i * 128;
+                    for (int ns = 0; ns < 32; ns++) {
+                        int ob = vh_base + ns * 4;
+                        rO[ob + 0] *= scale_old[0];
+                        rO[ob + 1] *= scale_old[0];
+                        rO[ob + 2] *= scale_old[1];
+                        rO[ob + 3] *= scale_old[1];
+                    }
+                }
+                // Phase 3: compute exp, sum, update rL
+                for (int lr = 0; lr < 2; lr++) {
+                    int pb_base = lr * 2;
                     float cs = 0;
                     for (int ns = 0; ns < TOPK_BLOCK_SIZE/8; ns++) {
                         int pb = ns*4 + pb_base;
@@ -317,17 +337,21 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                             static constexpr int TSV = (MODEL_TYPE == ModelType::V32) ? 0 : (HEAD_DIM_NOPE + 2 * HEAD_DIM_ROPE);
                             const int rsv = (MODEL_TYPE == ModelType::V32) ? params.stride_kv_row : TSV;
                             fp8* gK = (fp8*)params.kv + blk*params.stride_kv_block + rel*rsv;
-                            float sf[NUM_SCALES];
+                            union { float sf_f32[4]; bf16 sf_bf16[8]; } sf_union_v;
                             if constexpr (MODEL_TYPE==ModelType::V32)
-                                for (int si=0; si<4; si++) sf[si] = ((const float*)(gK + HEAD_DIM_NOPE))[si];
+                                for (int si=0; si<4; si++) sf_union_v.sf_f32[si] = ((const float*)(gK + HEAD_DIM_NOPE))[si];
                             else {
                                 static constexpr int TS2 = HEAD_DIM_NOPE + 2 * HEAD_DIM_ROPE;
                                 uint8_t* bsc2 = (uint8_t*)((fp8*)params.kv + blk*params.stride_kv_block)
                                                + params.page_block_size * TS2;
                                 fp8_e8m0* se2 = (fp8_e8m0*)(bsc2 + rel * NUM_SCALES);
-                                for (int si=0; si<NUM_SCALES; si+=2)
-                                    *(__nv_bfloat162_raw*)(sf+si) = __nv_cvt_e8m0x2_to_bf162raw(*(__nv_fp8x2_storage_t*)(se2+si));
+                                for (int si=0; si<NUM_SCALES; si+=2) {
+                                    __nv_bfloat162_raw raw = __nv_cvt_e8m0x2_to_bf162raw(*(__nv_fp8x2_storage_t*)(se2+si));
+                                    *reinterpret_cast<__nv_bfloat162_raw*>(sf_union_v.sf_bf16 + si) = raw;
+                                }
                             }
+                            float* sf_v = sf_union_v.sf_f32;
+                            bf16* sf_vb = sf_union_v.sf_bf16;
                             int vo = vh*HV;
                             for (int vi = 0; vi < HV/16; vi++) {
                                 int vd = vo + vi*16;
@@ -350,7 +374,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                                 fp8x16 src;
                                 *reinterpret_cast<uint2*>(&src.lo) = *reinterpret_cast<const uint2*>(gK + vd);
                                 *reinterpret_cast<uint2*>(&src.hi) = *reinterpret_cast<const uint2*>(gK + vd + 8);
-                                bf16 sc = (vd/QUANT_TILE_SIZE < NUM_SCALES) ? (bf16)sf[vd/QUANT_TILE_SIZE] : (bf16)1.0f;
+                                bf16 sc = (vd/QUANT_TILE_SIZE < NUM_SCALES) ? ((MODEL_TYPE==ModelType::V32) ? (bf16)sf_v[vd/QUANT_TILE_SIZE] : sf_vb[vd/QUANT_TILE_SIZE]) : (bf16)1.0f;
                                 bf16x8 lo = cvt_fp8x8_bf16x8(src.lo, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
                                 bf16x8 hi = cvt_fp8x8_bf16x8(src.hi, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
                                 for (int bi=0; bi<8; bi++) {
@@ -384,8 +408,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
         bool has_sink = (params.attn_sink != nullptr);
         float attn_sink_val[2] = {0.0f, 0.0f};
         if (has_sink) {
-            if (row0 < params.h_q) attn_sink_val[0] = __ldg((const float*)params.attn_sink + start_head_idx + row0) * (float)M_LOG2E;
-            if (row1 < params.h_q) attn_sink_val[1] = __ldg((const float*)params.attn_sink + start_head_idx + row1) * (float)M_LOG2E;
+            if (row0 < max_row) attn_sink_val[0] = __ldg((const float*)params.attn_sink + start_head_idx + row0) * (float)M_LOG2E;
+            if (row1 < max_row) attn_sink_val[1] = __ldg((const float*)params.attn_sink + start_head_idx + row1) * (float)M_LOG2E;
         }
         for (int lr = 0; lr < 2; lr++) {
             int r = lr == 0 ? row0 : row1;
@@ -395,7 +419,18 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                 denom += exp2f(attn_sink_val[lr] - M);
             }
             o_scale[lr] = (L == 0.0f) ? 0.0f : (1.0f / denom);
-            for (int i = lr*128; i < lr*128+128; i++) rO[i] *= o_scale[lr];
+        }
+        // Apply o_scale with correct interleaved rO layout:
+        // rO[vh*128 + ns*4 + 0..1] = row0, rO[vh*128 + ns*4 + 2..3] = row1
+        for (int vh_i = 0; vh_i < 2; vh_i++) {
+            int vh_base = vh_i * 128;
+            for (int ns = 0; ns < 32; ns++) {
+                int ob = vh_base + ns * 4;
+                rO[ob + 0] *= o_scale[0];
+                rO[ob + 1] *= o_scale[0];
+                rO[ob + 2] *= o_scale[1];
+                rO[ob + 3] *= o_scale[1];
+            }
         }
 
         // Write LSE
