@@ -440,13 +440,11 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
             float L0 = plan.sL[row0], M0 = plan.sM[row0];
             if (has_sink) {
                 float sink0 = __ldg((const float*)params.attn_sink + start_head_idx + row0) * (float)M_LOG2E;
-                float M_eff = fmaxf(M0, sink0);
-                // Guard: M_eff==-inf when both M0 and sink0 are -inf, giving NaN in subtraction
-                if (M_eff < -1e38f) {
-                    gLSE[row0] = INFINITY;
+                if (!isfinite(sink0)) {
+                    gLSE[row0] = (L0 == 0.0f) ? INFINITY : (logf(L0) + M0 / (float)M_LOG2E);
                 } else {
-                    float denom_lse = L0 * exp2f(M0 - M_eff) + exp2f(sink0 - M_eff);
-                    gLSE[row0] = logf(denom_lse) + M_eff / (float)M_LOG2E;
+                    float denom = L0 + exp2f(sink0 - M0);
+                    gLSE[row0] = (denom == 0.0f) ? INFINITY : (logf(denom) + M0 / (float)M_LOG2E);
                 }
             } else {
                 gLSE[row0] = (L0 == 0.0f) ? INFINITY : (logf(L0) + M0 / (float)M_LOG2E);
@@ -456,12 +454,11 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
             float L1 = plan.sL[row1], M1 = plan.sM[row1];
             if (has_sink) {
                 float sink1 = __ldg((const float*)params.attn_sink + start_head_idx + row1) * (float)M_LOG2E;
-                float M_eff = fmaxf(M1, sink1);
-                if (M_eff < -1e38f) {
-                    gLSE[row1] = INFINITY;
+                if (!isfinite(sink1)) {
+                    gLSE[row1] = (L1 == 0.0f) ? INFINITY : (logf(L1) + M1 / (float)M_LOG2E);
                 } else {
-                    float denom_lse = L1 * exp2f(M1 - M_eff) + exp2f(sink1 - M_eff);
-                    gLSE[row1] = logf(denom_lse) + M_eff / (float)M_LOG2E;
+                    float denom = L1 + exp2f(sink1 - M1);
+                    gLSE[row1] = (denom == 0.0f) ? INFINITY : (logf(denom) + M1 / (float)M_LOG2E);
                 }
             } else {
                 gLSE[row1] = (L1 == 0.0f) ? INFINITY : (logf(L1) + M1 / (float)M_LOG2E);
