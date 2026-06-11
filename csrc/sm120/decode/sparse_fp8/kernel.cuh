@@ -15,6 +15,10 @@ using fp8_e8m0 = __nv_fp8_e8m0;
 static constexpr float MAX_INIT_VAL = -1e30;
 
 // Isolated QK MMA: takes only pointers it needs, no params struct visibility
+// PTX ISA lane mapping for mma.sync.aligned.m16n8k16.row.col:
+//   A: M-rows = {lane%8, lane%8+8}, K-cols = (lane/8)*2 group
+//   B: groupID=lane/4, thread_in_group=lane%4
+//      K = {groupID, groupID+8}, N = {thread_in_group, thread_in_group+4}
 static __device__ __noinline__
 void qk_mma_kernel(bf16* sQ_ptr, bf16* sK_ptr, float* rP,
                    int p_dim, int topk_blocks, int lane_id, int mm_row) {
@@ -32,10 +36,12 @@ void qk_mma_kernel(bf16* sQ_ptr, bf16* sK_ptr, float* rP,
         }
         for (int ns = 0; ns < topk_blocks/8; ns++) {
             unsigned b_regs[2];
-            int bk0 = lane_id % 8, bk1 = bk0 + 8;
-            int bn0 = lane_id / 8, bn1 = bn0 + 4;
-            // b_regs[0]: same K-row (bk0), two N-columns (bn0, bn1)
-            // b_regs[1]: same K-row (bk1), two N-columns (bn0, bn1)
+            int groupID = lane_id / 4;
+            int tid = lane_id % 4;
+            int bk0 = groupID, bk1 = groupID + 8;
+            int bn0 = tid, bn1 = tid + 4;
+            // b_regs[0]: same K=bk0, two N-columns (bn0, bn1)
+            // b_regs[1]: same K=bk1, two N-columns (bn0, bn1)
             ((bf16*)&b_regs[0])[0] = sK_ptr[(ns*8+bn0)*p_dim + ks*16 + bk0];
             ((bf16*)&b_regs[0])[1] = sK_ptr[(ns*8+bn1)*p_dim + ks*16 + bk0];
             ((bf16*)&b_regs[1])[0] = sK_ptr[(ns*8+bn0)*p_dim + ks*16 + bk1];
@@ -71,10 +77,10 @@ void pv_mma_kernel(bf16* sS_ptr, bf16* sV_ptr, float* rO,
         }
         for (int ns = 0; ns < hv/8; ns++) {
             unsigned b_regs[2];
-            int bk0 = lane_id % 8, bk1 = bk0 + 8;
-            int bn0 = lane_id / 8, bn1 = bn0 + 4;
-            // b_regs[0]: same K-row (bk0), two N-columns (bn0, bn1)
-            // b_regs[1]: same K-row (bk1), two N-columns (bn0, bn1)
+            int groupID = lane_id / 4;
+            int tid = lane_id % 4;
+            int bk0 = groupID, bk1 = groupID + 8;
+            int bn0 = tid, bn1 = tid + 4;
             ((bf16*)&b_regs[0])[0] = sV_ptr[(ks*16 + bk0)*hv + (ns*8+bn0)];
             ((bf16*)&b_regs[0])[1] = sV_ptr[(ks*16 + bk0)*hv + (ns*8+bn1)];
             ((bf16*)&b_regs[1])[0] = sV_ptr[(ks*16 + bk1)*hv + (ns*8+bn0)];
