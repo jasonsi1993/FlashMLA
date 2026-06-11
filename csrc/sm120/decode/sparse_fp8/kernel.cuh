@@ -253,9 +253,29 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                 }
                 __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
 
-                // QK MMA via isolated __noinline__ function (no params visibility)
-                qk_mma_kernel<TiledMMA_QK>(plan.q.data(), plan.k.data(), rP,
-                              p_dim, TOPK_BLOCK_SIZE, lane_id, mm_row);
+                // SCALAR QK DEBUG: bypass MMA, compute QK via direct dot products
+                {
+                    int ar0 = lane_id % 8, ar1 = ar0 + 8;
+                    int bn0 = lane_id / 8, bn1 = bn0 + 4;
+                    for (int ns = 0; ns < TOPK_BLOCK_SIZE/8; ns++) {
+                        // rows for this thread
+                        int row0 = mm_row + ar0, row1 = mm_row + ar1;
+                        // columns: tokens (ns*8 + bn0) and (ns*8 + bn1)
+                        int tok0 = ns * 8 + bn0, tok1 = ns * 8 + bn1;
+                        float v00 = 0, v01 = 0, v10 = 0, v11 = 0;
+                        for (int k = 0; k < p_dim; k++) {
+                            float q0 = (float)plan.q.data()[row0 * p_dim + k];
+                            float q1 = (float)plan.q.data()[row1 * p_dim + k];
+                            float k0 = (float)plan.k.data()[tok0 * p_dim + k];
+                            float k1 = (float)plan.k.data()[tok1 * p_dim + k];
+                            v00 += q0 * k0; v01 += q0 * k1;
+                            v10 += q1 * k0; v11 += q1 * k1;
+                        }
+                        int pb = ns * 4;
+                        rP[pb + 0] += v00; rP[pb + 1] += v01;
+                        rP[pb + 2] += v10; rP[pb + 3] += v11;
+                    }
+                }
                 __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
             }  // QK passes
 
