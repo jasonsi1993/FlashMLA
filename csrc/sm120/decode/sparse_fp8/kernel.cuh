@@ -21,7 +21,7 @@ void qk_mma_kernel(bf16* sQ_ptr, bf16* sK_ptr, float* rP,
     for (int ks = 0; ks < p_dim/16; ks++) {
         unsigned a_regs[4];
         int ar0 = lane_id % 8, ar1 = ar0 + 8;
-        int a_col = (lane_id / 8) * 4;
+        int a_col = (lane_id / 8) * 2;
         for (int g = 0; g < 2; g++) {
             int r = (g == 0 ? ar0 : ar1);
             bf16* a_src = sQ_ptr + (mm_row+r)*p_dim + ks*16;
@@ -60,7 +60,7 @@ void pv_mma_kernel(bf16* sS_ptr, bf16* sV_ptr, float* rO,
     for (int ks = 0; ks < topk_blocks/16; ks++) {
         unsigned a_regs[4];
         int ar0 = lane_id % 8, ar1 = ar0 + 8;
-        int a_col = (lane_id / 8) * 4;
+        int a_col = (lane_id / 8) * 2;
         for (int g = 0; g < 2; g++) {
             int r = (g==0 ? ar0 : ar1);
             bf16* a_src = sS_ptr + (mm_row+r)*topk_blocks + ks*16;
