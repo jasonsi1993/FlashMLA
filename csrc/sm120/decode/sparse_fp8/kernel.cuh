@@ -14,47 +14,58 @@ using fp8_e8m0 = __nv_fp8_e8m0;
 
 static constexpr float MAX_INIT_VAL = -1e30;
 
-// Isolated QK MMA: takes only pointers it needs, no params struct visibility
-// PTX ISA lane mapping for mma.sync.aligned.m16n8k16.row.col:
-//   A: M-rows = {lane%8, lane%8+8}, K-cols = (lane/8)*2 group
-//   B: groupID=lane/4, thread_in_group=lane%4
-//      K = {groupID, groupID+8}, N = {thread_in_group, thread_in_group+4}
+// QK MMA: uses CuTe for correct register layout, manual asm for MMA instruction
+// Templated on the TiledMMA type to get correct per-warp partitioning
+template<typename TiledMMA>
 static __device__ __noinline__
 void qk_mma_kernel(bf16* sQ_ptr, bf16* sK_ptr, float* rP,
                    int p_dim, int topk_blocks, int lane_id, int mm_row) {
+    ThrMMA thr = TiledMMA{}.get_slice(lane_id);
+
     for (int ks = 0; ks < p_dim/16; ks++) {
-        unsigned a_regs[4];
-        int ar0 = lane_id % 8, ar1 = ar0 + 8;
-        int a_col = (lane_id / 8) * 2;
-        for (int g = 0; g < 2; g++) {
-            int r = (g == 0 ? ar0 : ar1);
-            bf16* a_src = sQ_ptr + (mm_row+r)*p_dim + ks*16;
-            ((bf16*)&a_regs[g*2])[0]   = a_src[a_col];
-            ((bf16*)&a_regs[g*2])[1]   = a_src[a_col + 1];
-            ((bf16*)&a_regs[g*2+1])[0] = a_src[a_col + 8];
-            ((bf16*)&a_regs[g*2+1])[1] = a_src[a_col + 9];
-        }
+        // Q: [16 rows, K dims] at warp offset + ks*16
+        Tensor sQ = make_tensor(make_smem_ptr(sQ_ptr + mm_row * p_dim + ks * 16),
+            Layout<Shape<_16, _16>, Stride<_16, _1>>{});
+
+        // K: [64 tokens, K dims]
+        Tensor sK = make_tensor(make_smem_ptr(sK_ptr + ks * 16),
+            Layout<Shape<_64, _16>, Stride<_16, _1>>{});
+
+        // CuTe partition: per-thread smem views
+        Tensor tCsQ = thr.partition_A(sQ);
+        Tensor tCsK = thr.partition_B(sK);
+
+        // Load A from smem into registers via CuTe
+        Tensor tCrQ = thr.make_fragment_A(tCsQ);
+        cute::copy(tCsQ, tCrQ);
+        unsigned a_regs[4] = {0};
+        #pragma unroll
+        for (int i = 0; i < 4; i++)
+            a_regs[i] = reinterpret_cast<const unsigned&>(tCrQ(i, _0{}, _0{}));
+
         for (int ns = 0; ns < topk_blocks/8; ns++) {
-            unsigned b_regs[2];
-            int groupID = lane_id / 4;
-            int tid = lane_id % 4;
-            int bk0 = groupID, bk1 = groupID + 8;
-            int bn0 = tid, bn1 = tid + 4;
-            // b_regs[0]: same K=bk0, two N-columns (bn0, bn1)
-            // b_regs[1]: same K=bk1, two N-columns (bn0, bn1)
-            ((bf16*)&b_regs[0])[0] = sK_ptr[(ns*8+bn0)*p_dim + ks*16 + bk0];
-            ((bf16*)&b_regs[0])[1] = sK_ptr[(ns*8+bn1)*p_dim + ks*16 + bk0];
-            ((bf16*)&b_regs[1])[0] = sK_ptr[(ns*8+bn0)*p_dim + ks*16 + bk1];
-            ((bf16*)&b_regs[1])[1] = sK_ptr[(ns*8+bn1)*p_dim + ks*16 + bk1];
-            float c[4]; int pb = ns * 4;
-            c[0]=rP[pb]; c[1]=rP[pb+1]; c[2]=rP[pb+2]; c[3]=rP[pb+3];
+            // B for this ns token group: [8 tokens, K dims]
+            Tensor sK_ns = make_tensor(make_smem_ptr(sK_ptr + ns * 8 * p_dim + ks * 16),
+                Layout<Shape<_8, _16>, Stride<_16, _1>>{});
+
+            Tensor tCsK_ns = thr.partition_B(sK_ns);
+            Tensor tCrK = thr.make_fragment_B(tCsK_ns);
+            cute::copy(tCsK_ns, tCrK);
+            unsigned b_regs[2] = {0};
+            #pragma unroll
+            for (int i = 0; i < 2; i++)
+                b_regs[i] = reinterpret_cast<const unsigned&>(tCrK(i, _0{}, _0{}));
+
+            float c[4] = {0, 0, 0, 0};
             asm volatile(
                 "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                 : "r"(a_regs[0]), "r"(a_regs[1]), "r"(a_regs[2]), "r"(a_regs[3]),
                   "r"(b_regs[0]), "r"(b_regs[1]));
-            rP[pb]=c[0]; rP[pb+1]=c[1]; rP[pb+2]=c[2]; rP[pb+3]=c[3];
+
+            int pb = ns * 4;
+            rP[pb] += c[0]; rP[pb+1] += c[1]; rP[pb+2] += c[2]; rP[pb+3] += c[3];
         }
     }
 }
@@ -77,10 +88,8 @@ void pv_mma_kernel(bf16* sS_ptr, bf16* sV_ptr, float* rO,
         }
         for (int ns = 0; ns < hv/8; ns++) {
             unsigned b_regs[2];
-            int groupID = lane_id / 4;
-            int tid = lane_id % 4;
-            int bk0 = groupID, bk1 = groupID + 8;
-            int bn0 = tid, bn1 = tid + 4;
+            int bk0 = lane_id % 8, bk1 = bk0 + 8;
+            int bn0 = lane_id / 8, bn1 = bn0 + 4;
             ((bf16*)&b_regs[0])[0] = sV_ptr[(ks*16 + bk0)*hv + (ns*8+bn0)];
             ((bf16*)&b_regs[0])[1] = sV_ptr[(ks*16 + bk0)*hv + (ns*8+bn1)];
             ((bf16*)&b_regs[1])[0] = sV_ptr[(ks*16 + bk1)*hv + (ns*8+bn0)];
@@ -245,7 +254,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                 __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
 
                 // QK MMA via isolated __noinline__ function (no params visibility)
-                qk_mma_kernel(plan.q.data(), plan.k.data(), rP,
+                qk_mma_kernel<TiledMMA_QK>(plan.q.data(), plan.k.data(), rP,
                               p_dim, TOPK_BLOCK_SIZE, lane_id, mm_row);
                 __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
             }  // QK passes
