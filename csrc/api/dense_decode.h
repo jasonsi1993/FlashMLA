@@ -174,6 +174,10 @@ dense_attn_decode_interface(
     params.stream = at::cuda::getCurrentCUDAStream().stream();
 
     if (arch.is_sm120f()) {
+        // SM120 dense decode kernel does not yet support causal masking.
+        TORCH_CHECK(!params.is_causal,
+            "SM120 dense decode does not support is_causal=True. "
+            "Use SM90 path or disable causal masking.");
         // SM120: use WMMA-based dense decode kernel
         sm120::DecodingParams sm120_params;
         sm120_params.b = params.b;
