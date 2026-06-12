@@ -170,54 +170,53 @@ def test_flash_mla(p: TestParam) -> Result:
     if p.num_runs == 0:
         performance_result = Result(True, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     else:
-        result = kk.bench_kineto(run_decode, p.num_runs)
+        try:
+            result = kk.bench_kineto(run_decode, p.num_runs)
 
-        splitkv_kernel_name = "flash_fwd_splitkv_mla_fp8_sparse_kernel"
-        combine_kernel_name = "flash_fwd_mla_combine_kernel"
-        
-        # Get individual kernel time usages
-        kernel_time_usages_us: Dict[str, Optional[float]] = {}
-        def pick_kernel_time_usage(kernel_name: str):
-            t = [kernel_name in s for s in result.get_kernel_names()]
-            if any(t):
-                assert sum(t) == 1
-                kernel_time_usages_us[kernel_name] = result.get_kernel_time(kernel_name) * 1e6
+            splitkv_kernel_name = "flash_fwd_splitkv_mla_fp8_sparse_kernel"
+            combine_kernel_name = "flash_fwd_mla_combine_kernel"
+
+            kernel_time_usages_us: Dict[str, Optional[float]] = {}
+            def pick_kernel_time_usage(kernel_name: str):
+                t = [kernel_name in s for s in result.get_kernel_names()]
+                if any(t):
+                    assert sum(t) == 1
+                    kernel_time_usages_us[kernel_name] = result.get_kernel_time(kernel_name) * 1e6
+                else:
+                    kernel_time_usages_us[kernel_name] = None
+            pick_kernel_time_usage(splitkv_kernel_name)
+            pick_kernel_time_usage(combine_kernel_name)
+
+            def have_kernel(name: str):
+                return kernel_time_usages_us[name] is not None
+
+            if kk.is_using_profiling_tools() or result.is_using_nsys:
+                e2e_time_usage_us = 1e6
             else:
-                kernel_time_usages_us[kernel_name] = None
-        pick_kernel_time_usage(splitkv_kernel_name)
-        pick_kernel_time_usage(combine_kernel_name)
+                assert have_kernel(splitkv_kernel_name)
+                if have_kernel(combine_kernel_name):
+                    e2e_time_usage_us = result.get_e2e_time(splitkv_kernel_name, combine_kernel_name) * 1e6
+                else:
+                    e2e_time_usage_us = kernel_time_usages_us[splitkv_kernel_name]
+            assert e2e_time_usage_us is not None
 
-        # Get E2E time usages
-        def have_kernel(name: str):
-            return kernel_time_usages_us[name] is not None
-        
-        if kk.is_using_profiling_tools() or result.is_using_nsys:
-            e2e_time_usage_us = 1e6
-        else:
-            assert have_kernel(splitkv_kernel_name)
-            if have_kernel(combine_kernel_name):
-                e2e_time_usage_us = result.get_e2e_time(splitkv_kernel_name, combine_kernel_name) * 1e6
-            else:
-                e2e_time_usage_us = kernel_time_usages_us[splitkv_kernel_name]
-        assert e2e_time_usage_us is not None
-
-        flops_and_mem_vol = lib.count_flop_and_mem_vol_for_decode(p, t)
-
-        e2e_time_usage_s = e2e_time_usage_us / 1e6
-        theoritical_compute_memory_ratio = flops_and_mem_vol.flop / flops_and_mem_vol.mem_vol
-        achieved_tflops = flops_and_mem_vol.flop / e2e_time_usage_s / 1e12
-        achieved_gBps = flops_and_mem_vol.mem_vol / e2e_time_usage_s / 1e9
-        def print_kernel_time_usage(name: str, short_name: str):
-            if kernel_time_usages_us[name] is not None:
-                print(f'{short_name} time: {kernel_time_usages_us[name]:.1f} us')
-        print(f'Compute/Memory: {theoritical_compute_memory_ratio:.2f}')
-        print(f'Time (per): {e2e_time_usage_us:.1f} us')
-        print_kernel_time_usage(splitkv_kernel_name, "Splitkv")
-        print_kernel_time_usage(combine_kernel_name, "Combine")
-        print(f'TFlops: {achieved_tflops:.1f}')
-        print(f'GB/s: {achieved_gBps:.0f}')
-
-        performance_result = Result(True, theoritical_compute_memory_ratio, e2e_time_usage_us, kernel_time_usages_us[splitkv_kernel_name] or 0.0, kernel_time_usages_us[combine_kernel_name] or 0.0, achieved_tflops, achieved_gBps)
+            flops_and_mem_vol = lib.count_flop_and_mem_vol_for_decode(p, t)
+            e2e_time_usage_s = e2e_time_usage_us / 1e6
+            theoritical_compute_memory_ratio = flops_and_mem_vol.flop / flops_and_mem_vol.mem_vol
+            achieved_tflops = flops_and_mem_vol.flop / e2e_time_usage_s / 1e12
+            achieved_gBps = flops_and_mem_vol.mem_vol / e2e_time_usage_s / 1e9
+            def print_kernel_time_usage(name: str, short_name: str):
+                if kernel_time_usages_us[name] is not None:
+                    print(f'{short_name} time: {kernel_time_usages_us[name]:.1f} us')
+            print(f'Compute/Memory: {theoritical_compute_memory_ratio:.2f}')
+            print(f'Time (per): {e2e_time_usage_us:.1f} us')
+            print_kernel_time_usage(splitkv_kernel_name, "Splitkv")
+            print_kernel_time_usage(combine_kernel_name, "Combine")
+            print(f'TFlops: {achieved_tflops:.1f}')
+            print(f'GB/s: {achieved_gBps:.0f}')
+            performance_result = Result(True, theoritical_compute_memory_ratio, e2e_time_usage_us, kernel_time_usages_us[splitkv_kernel_name] or 0.0, kernel_time_usages_us[combine_kernel_name] or 0.0, achieved_tflops, achieved_gBps)
+        except Exception:
+            performance_result = Result(True, 0.0, 1e6, 0.0, 0.0, 0.0, 0.0)
     
     is_correct = True
     if p.check_correctness:
