@@ -75,26 +75,36 @@ void qk_mma_kernel(bf16* sQ_ptr, bf16* sK_ptr, float* rP,
 static __device__ __noinline__
 void pv_mma_kernel(float* sS_ptr, bf16* sV_ptr, float* rO,
                    int hv, int topk_blocks, int vh, int lane_id, int mm_row) {
+    // PTX m16n8k16 fragments are indexed by groupID=lane/4 and
+    // threadID_in_group=lane%4.  The accumulator registers hold
+    // (row=groupID, col=tid*2 + {0,1}) in c0/c1 and
+    // (row=groupID+8, col=tid*2 + {0,1}) in c2/c3.
+    const int group_id = lane_id >> 2;
+    const int tid_in_group = lane_id & 3;
+    const int m_row0 = mm_row + group_id;
+    const int m_row1 = m_row0 + 8;
+    const int k_col0 = tid_in_group * 2;
+
     for (int ks = 0; ks < topk_blocks/16; ks++) {
         unsigned a_regs[4];
-        int ar0 = lane_id % 8, ar1 = ar0 + 8;
-        int a_col = (lane_id / 8) * 2;
-        for (int g = 0; g < 2; g++) {
-            int r = (g==0 ? ar0 : ar1);
-            float* a_src = sS_ptr + (mm_row+r)*topk_blocks + ks*16;
-            ((bf16*)&a_regs[g*2])[0]   = (bf16)(a_src[a_col]);
-            ((bf16*)&a_regs[g*2])[1]   = (bf16)(a_src[a_col + 1]);
-            ((bf16*)&a_regs[g*2+1])[0] = (bf16)(a_src[a_col + 8]);
-            ((bf16*)&a_regs[g*2+1])[1] = (bf16)(a_src[a_col + 9]);
-        }
+        float* a_src0 = sS_ptr + m_row0 * topk_blocks + ks * 16;
+        float* a_src1 = sS_ptr + m_row1 * topk_blocks + ks * 16;
+        ((bf16*)&a_regs[0])[0] = (bf16)(a_src0[k_col0]);
+        ((bf16*)&a_regs[0])[1] = (bf16)(a_src0[k_col0 + 1]);
+        ((bf16*)&a_regs[1])[0] = (bf16)(a_src1[k_col0]);
+        ((bf16*)&a_regs[1])[1] = (bf16)(a_src1[k_col0 + 1]);
+        ((bf16*)&a_regs[2])[0] = (bf16)(a_src0[k_col0 + 8]);
+        ((bf16*)&a_regs[2])[1] = (bf16)(a_src0[k_col0 + 9]);
+        ((bf16*)&a_regs[3])[0] = (bf16)(a_src1[k_col0 + 8]);
+        ((bf16*)&a_regs[3])[1] = (bf16)(a_src1[k_col0 + 9]);
+
         for (int ns = 0; ns < hv/8; ns++) {
             unsigned b_regs[2];
-            int bk0 = lane_id % 8, bk1 = bk0 + 8;
-            int bn0 = lane_id / 8, bn1 = bn0 + 4;
-            ((bf16*)&b_regs[0])[0] = sV_ptr[(ks*16 + bk0)*hv + (ns*8+bn0)];
-            ((bf16*)&b_regs[0])[1] = sV_ptr[(ks*16 + bk0)*hv + (ns*8+bn1)];
-            ((bf16*)&b_regs[1])[0] = sV_ptr[(ks*16 + bk1)*hv + (ns*8+bn0)];
-            ((bf16*)&b_regs[1])[1] = sV_ptr[(ks*16 + bk1)*hv + (ns*8+bn1)];
+            int n_col = ns * 8 + group_id;
+            ((bf16*)&b_regs[0])[0] = sV_ptr[(ks*16 + k_col0) * hv + n_col];
+            ((bf16*)&b_regs[0])[1] = sV_ptr[(ks*16 + k_col0 + 1) * hv + n_col];
+            ((bf16*)&b_regs[1])[0] = sV_ptr[(ks*16 + k_col0 + 8) * hv + n_col];
+            ((bf16*)&b_regs[1])[1] = sV_ptr[(ks*16 + k_col0 + 9) * hv + n_col];
             int ob = ns * 4 + vh * 128;
             float c[4];
             c[0]=rO[ob]; c[1]=rO[ob+1]; c[2]=rO[ob+2]; c[3]=rO[ob+3];
@@ -129,7 +139,14 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
     static constexpr int TOTAL_QK_TILES = HEAD_DIM_K / 64;
     static constexpr int NUM_PASSES = (TOTAL_QK_TILES + QK_TILES_PER_PASS - 1) / QK_TILES_PER_PASS;
 
-    int c_col0 = lane_id / 8;  // used by softmax
+    // Keep the raw mma.sync fragment layout explicit.  Earlier code used
+    // lane%8/lane/8 coordinates, which do not match PTX m16n8k16 and caused
+    // correct K/V data to flow through the wrong QK/PV/output lanes.
+    const int group_id = lane_id >> 2;
+    const int tid_in_group = lane_id & 3;
+    const int mma_row0 = group_id;
+    const int mma_row1 = group_id + 8;
+    const int mma_col0 = tid_in_group * 2;  // used by softmax and stores
 
     // Diagnostic: zero-init shared memory to rule out cold-start read-before-write
     for (int i = threadIdx.x; i < sizeof(SharedMemoryPlan)/4; i += NUM_THREADS) {
@@ -389,30 +406,30 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                 {
                     bf16* sQ_ptr = plan.q.data();
                     bf16* sK_ptr = plan.k.data();
-                    int ar0 = lane_id % 8, ar1 = ar0 + 8;
-                    int a_col = (lane_id / 8) * 2;
-                    int bk0 = lane_id % 8, bk1 = bk0 + 8;
-                    int bn0 = lane_id / 8, bn1 = bn0 + 4;
+                    int q_row0 = mm_row + mma_row0;
+                    int q_row1 = mm_row + mma_row1;
+                    int k_col0 = mma_col0;
 
                     for (int ks = 0; ks < p_dim/16; ks++) {
                         unsigned a_regs[4];
-                        for (int g = 0; g < 2; g++) {
-                            int r = (g == 0) ? ar0 : ar1;
-                            bf16* q_row = sQ_ptr + (mm_row + r) * p_dim + ks * 16;
-                            ((bf16*)&a_regs[g*2])[0]   = q_row[a_col];
-                            ((bf16*)&a_regs[g*2])[1]   = q_row[a_col + 1];
-                            ((bf16*)&a_regs[g*2+1])[0] = q_row[a_col + 8];
-                            ((bf16*)&a_regs[g*2+1])[1] = q_row[a_col + 9];
-                        }
+                        bf16* q0 = sQ_ptr + q_row0 * p_dim + ks * 16;
+                        bf16* q1 = sQ_ptr + q_row1 * p_dim + ks * 16;
+                        ((bf16*)&a_regs[0])[0] = q0[k_col0];
+                        ((bf16*)&a_regs[0])[1] = q0[k_col0 + 1];
+                        ((bf16*)&a_regs[1])[0] = q1[k_col0];
+                        ((bf16*)&a_regs[1])[1] = q1[k_col0 + 1];
+                        ((bf16*)&a_regs[2])[0] = q0[k_col0 + 8];
+                        ((bf16*)&a_regs[2])[1] = q0[k_col0 + 9];
+                        ((bf16*)&a_regs[3])[0] = q1[k_col0 + 8];
+                        ((bf16*)&a_regs[3])[1] = q1[k_col0 + 9];
 
                         for (int ns = 0; ns < TOPK_BLOCK_SIZE/8; ns++) {
                             unsigned b_regs[2];
-                            bf16* k_row0 = sK_ptr + (ns * 8 + bn0) * p_dim + ks * 16;
-                            bf16* k_row1 = sK_ptr + (ns * 8 + bn1) * p_dim + ks * 16;
-                            ((bf16*)&b_regs[0])[0] = k_row0[bk0];
-                            ((bf16*)&b_regs[0])[1] = k_row0[bk1];
-                            ((bf16*)&b_regs[1])[0] = k_row1[bk0];
-                            ((bf16*)&b_regs[1])[1] = k_row1[bk1];
+                            bf16* k_row = sK_ptr + (ns * 8 + group_id) * p_dim + ks * 16;
+                            ((bf16*)&b_regs[0])[0] = k_row[k_col0];
+                            ((bf16*)&b_regs[0])[1] = k_row[k_col0 + 1];
+                            ((bf16*)&b_regs[1])[0] = k_row[k_col0 + 8];
+                            ((bf16*)&b_regs[1])[1] = k_row[k_col0 + 9];
 
                             int pb = ns * 4;
                             float c[4] = {rP[pb], rP[pb+1], rP[pb+2], rP[pb+3]};
@@ -442,12 +459,12 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                     int pb_base = lr * 2;
                     for (int ns = 0; ns < TOPK_BLOCK_SIZE/8; ns++) {
                         int pb = ns*4 + pb_base;
-                        int col0 = ns*8 + c_col0, col1 = col0 + 4;
+                        int col0 = ns*8 + mma_col0, col1 = col0 + 1;
                         if (col0 < TOPK_BLOCK_SIZE && plan.is_kv_valid[col0]) cm = fmaxf(cm, rP[pb]);
                         if (col1 < TOPK_BLOCK_SIZE && plan.is_kv_valid[col1]) cm = fmaxf(cm, rP[pb+1]);
                     }
-                    cm = fmaxf(cm, __shfl_xor_sync(0xffffffff, cm, 8));
-                    cm = fmaxf(cm, __shfl_xor_sync(0xffffffff, cm, 16));
+                    cm = fmaxf(cm, __shfl_xor_sync(0xffffffff, cm, 1));
+                    cm = fmaxf(cm, __shfl_xor_sync(0xffffffff, cm, 2));
                     cm *= params.sm_scale_div_log2;
                     float om = rM[lr]; rM[lr] = fmaxf(cm, om);
                     scale_old[lr] = exp2f(om - rM[lr]);
@@ -469,7 +486,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                     float cs = 0;
                     for (int ns = 0; ns < TOPK_BLOCK_SIZE/8; ns++) {
                         int pb = ns*4 + pb_base;
-                        int col0 = ns*8 + c_col0, col1 = col0 + 4;
+                        int col0 = ns*8 + mma_col0, col1 = col0 + 1;
                         if (col0 < TOPK_BLOCK_SIZE) {
                             rP[pb] = plan.is_kv_valid[col0] ? exp2f(rP[pb]*params.sm_scale_div_log2 - rM[lr]) : 0;
                             rP[pb+1] = plan.is_kv_valid[col1] ? exp2f(rP[pb+1]*params.sm_scale_div_log2 - rM[lr]) : 0;
@@ -477,26 +494,26 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                             if (plan.is_kv_valid[col1]) cs += rP[pb+1];
                         }
                     }
-                    cs += __shfl_xor_sync(0xffffffff, cs, 8);
-                    cs += __shfl_xor_sync(0xffffffff, cs, 16);
+                    cs += __shfl_xor_sync(0xffffffff, cs, 1);
+                    cs += __shfl_xor_sync(0xffffffff, cs, 2);
                     rL[lr] = rL[lr]*scale_old[lr] + cs;
                 }
             }
 
             // Store S to shared memory (needed for PV)
             // Corrected register layout:
-            //   rP[ns*4+0]: S[row0, ns*8 + lane/8]
-            //   rP[ns*4+1]: S[row0, ns*8 + lane/8 + 4]
-            //   rP[ns*4+2]: S[row1, ns*8 + lane/8]
-            //   rP[ns*4+3]: S[row1, ns*8 + lane/8 + 4]
-            //   row0 = mm_row + lane%8, row1 = row0 + 8
+            //   rP[ns*4+0]: S[row0, ns*8 + (lane%4)*2]
+            //   rP[ns*4+1]: S[row0, ns*8 + (lane%4)*2 + 1]
+            //   rP[ns*4+2]: S[row1, ns*8 + (lane%4)*2]
+            //   rP[ns*4+3]: S[row1, ns*8 + (lane%4)*2 + 1]
+            //   row0 = mm_row + lane/4, row1 = row0 + 8
             float* sS_ptr = plan.s.data();
-            int sr0 = mm_row + (lane_id % 8);
-            int sr1 = sr0 + 8;
+            int sr0 = mm_row + mma_row0;
+            int sr1 = mm_row + mma_row1;
             for (int ns = 0; ns < TOPK_BLOCK_SIZE/8; ns++) {
                 int pb = ns * 4;
-                int sc0 = ns * 8 + (lane_id / 8);
-                int sc1 = sc0 + 4;
+                int sc0 = ns * 8 + mma_col0;
+                int sc1 = sc0 + 1;
                 if (sc0 < TOPK_BLOCK_SIZE) {
                     sS_ptr[sr0 * TOPK_BLOCK_SIZE + sc0] = rP[pb];
                     sS_ptr[sr0 * TOPK_BLOCK_SIZE + sc1] = rP[pb + 1];
@@ -587,8 +604,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
         }  // main/extra KV scopes
 
         // ---- Normalize output, write LSE and O ----
-        int row0 = mm_row + (lane_id % 8);
-        int row1 = row0 + 8;
+        int row0 = mm_row + mma_row0;
+        int row1 = mm_row + mma_row1;
         if (row0 < BLOCK_M) { plan.sM[row0] = rM[0]; plan.sL[row0] = rL[0]; }
         if (row1 < BLOCK_M) { plan.sM[row1] = rM[1]; plan.sL[row1] = rL[1]; }
         __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
@@ -641,8 +658,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                  + s_q_idx*params.stride_o_s_q + start_head_idx*params.stride_o_h_q;
         for (int ns = 0; ns < HEAD_DIM_V/8; ns++) {
             int ob = ns * 4;
-            int oc0 = ns * 8 + (lane_id / 8);
-            int oc1 = oc0 + 4;
+            int oc0 = ns * 8 + mma_col0;
+            int oc1 = oc0 + 1;
             if (oc0 < HEAD_DIM_V) {
                 if (row0 < max_row) {
                     gO[row0 * params.stride_o_h_q + oc0] = (bf16)rO[ob];
@@ -688,4 +705,3 @@ void run_sm120_sparse_decode_kernel(const SparseAttnDecodeParams &params) {
 }
 
 }  // namespace sm120::decode::sparse_fp8
-
