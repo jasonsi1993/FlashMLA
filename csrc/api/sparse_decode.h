@@ -502,13 +502,34 @@ sparse_attn_decode_interface(
             cur_params.b = cur_b;
             cur_params.q += batch_start * params.stride_q_b;
             cur_params.indices += batch_start * params.stride_indices_b;
+            if (cur_params.topk_length != nullptr) {
+                cur_params.topk_length += batch_start;
+            }
+            if (cur_params.extra_indices != nullptr) {
+                cur_params.extra_indices += batch_start * params.stride_extra_indices_b;
+            }
+            if (cur_params.extra_topk_length != nullptr) {
+                cur_params.extra_topk_length += batch_start;
+            }
             cur_params.lse += batch_start * params.stride_lse_b;
             cur_params.out += batch_start * params.stride_o_b;
 
             if (model_type == ModelType::V32) {
-                sm120::decode::sparse_fp8::run_sm120_sparse_decode_kernel<ModelType::V32, 64>(cur_params);
+                if (h_q == 64) {
+                    sm120::decode::sparse_fp8::run_sm120_sparse_decode_kernel<ModelType::V32, 64>(cur_params);
+                } else if (h_q == 128) {
+                    sm120::decode::sparse_fp8::run_sm120_sparse_decode_kernel<ModelType::V32, 128>(cur_params);
+                } else {
+                    TORCH_CHECK(false, "Unsupported h_q for SM120 sparse decode: ", h_q);
+                }
             } else {
-                sm120::decode::sparse_fp8::run_sm120_sparse_decode_kernel<ModelType::MODEL1, 64>(cur_params);
+                if (h_q == 64) {
+                    sm120::decode::sparse_fp8::run_sm120_sparse_decode_kernel<ModelType::MODEL1, 64>(cur_params);
+                } else if (h_q == 128) {
+                    sm120::decode::sparse_fp8::run_sm120_sparse_decode_kernel<ModelType::MODEL1, 128>(cur_params);
+                } else {
+                    TORCH_CHECK(false, "Unsupported h_q for SM120 sparse decode: ", h_q);
+                }
             }
         }
     } else {
