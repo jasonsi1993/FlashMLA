@@ -63,7 +63,7 @@ void qk_mma_kernel(bf16* sQ_ptr, bf16* sK_ptr, float* rP,
                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                 : "r"(a_regs[0]), "r"(a_regs[1]), "r"(a_regs[2]), "r"(a_regs[3]),
-                  "r"(b_regs[0]), "r"(b_regs[1]));
+                  "r"(b_regs[0]), "r"(b_regs[1]) : "memory");
 
             int pb = ns * 4;
             rP[pb] += c[0]; rP[pb+1] += c[1]; rP[pb+2] += c[2]; rP[pb+3] += c[3];
@@ -113,7 +113,7 @@ void pv_mma_kernel(float* sS_ptr, bf16* sV_ptr, float* rO,
                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                 : "r"(a_regs[0]), "r"(a_regs[1]), "r"(a_regs[2]), "r"(a_regs[3]),
-                  "r"(b_regs[0]), "r"(b_regs[1]));
+                  "r"(b_regs[0]), "r"(b_regs[1]) : "memory");
             rO[ob]=c[0]; rO[ob+1]=c[1]; rO[ob+2]=c[2]; rO[ob+3]=c[3];
         }
     }
@@ -163,7 +163,6 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
 
     for (int batch_idx = 0; batch_idx < smem_b; batch_idx++) {
         float rM[2] = {MAX_INIT_VAL, MAX_INIT_VAL}, rL[2] = {0, 0};
-        // O accumulator: 16 rows x 512 cols per warp, 4 floats per 16x8 mma tile = 256 floats/thread
         float rO[256]; for (int i = 0; i < 256; i++) rO[i] = 0.0f;
         int num_scopes = (params.extra_kv != nullptr) ? 2 : 1;
         for (int scope_idx = 0; scope_idx < num_scopes; scope_idx++) {
@@ -343,7 +342,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                                 : "r"(a_regs[0]), "r"(a_regs[1]), "r"(a_regs[2]), "r"(a_regs[3]),
-                                  "r"(b_regs[0]), "r"(b_regs[1]));
+                                  "r"(b_regs[0]), "r"(b_regs[1]) : "memory");
                             rP[pb] = c[0]; rP[pb+1] = c[1]; rP[pb+2] = c[2]; rP[pb+3] = c[3];
                         }
                     }
