@@ -6,6 +6,7 @@
 #include "utils.h"
 #include "sm90/decode/sparse_fp8/components/dequant.h"
 #include "config.h"
+#include "debug.h"
 
 namespace sm120::decode::sparse_fp8 {
 using sm90::decode::sparse_fp8::fp8x16;
@@ -72,7 +73,7 @@ void qk_mma_kernel(bf16* sQ_ptr, bf16* sK_ptr, float* rP,
 
 // Isolated PV MMA: takes only pointers it needs
 static __device__ __noinline__
-void pv_mma_kernel(bf16* sS_ptr, bf16* sV_ptr, float* rO,
+void pv_mma_kernel(float* sS_ptr, bf16* sV_ptr, float* rO,
                    int hv, int topk_blocks, int vh, int lane_id, int mm_row) {
     for (int ks = 0; ks < topk_blocks/16; ks++) {
         unsigned a_regs[4];
@@ -80,11 +81,11 @@ void pv_mma_kernel(bf16* sS_ptr, bf16* sV_ptr, float* rO,
         int a_col = (lane_id / 8) * 2;
         for (int g = 0; g < 2; g++) {
             int r = (g==0 ? ar0 : ar1);
-            bf16* a_src = sS_ptr + (mm_row+r)*topk_blocks + ks*16;
-            ((bf16*)&a_regs[g*2])[0]   = a_src[a_col];
-            ((bf16*)&a_regs[g*2])[1]   = a_src[a_col + 1];
-            ((bf16*)&a_regs[g*2+1])[0] = a_src[a_col + 8];
-            ((bf16*)&a_regs[g*2+1])[1] = a_src[a_col + 9];
+            float* a_src = sS_ptr + (mm_row+r)*topk_blocks + ks*16;
+            ((bf16*)&a_regs[g*2])[0]   = (bf16)(a_src[a_col]);
+            ((bf16*)&a_regs[g*2])[1]   = (bf16)(a_src[a_col + 1]);
+            ((bf16*)&a_regs[g*2+1])[0] = (bf16)(a_src[a_col + 8]);
+            ((bf16*)&a_regs[g*2+1])[1] = (bf16)(a_src[a_col + 9]);
         }
         for (int ns = 0; ns < hv/8; ns++) {
             unsigned b_regs[2];
@@ -141,6 +142,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
     __shared__ int smem_topk;
     if (threadIdx.x == 0) { smem_b = params.b; smem_topk = params.topk; }
     __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
+
 
     for (int batch_idx = 0; batch_idx < smem_b; batch_idx++) {
         float rM[2] = {MAX_INIT_VAL, MAX_INIT_VAL}, rL[2] = {0, 0};
@@ -217,6 +219,14 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                             ? 0 : (HEAD_DIM_NOPE + 2 * HEAD_DIM_ROPE);
                         const int rs = (MODEL_TYPE == ModelType::V32) ? scope_stride_kv_row : TSTRIDE;
                         bf16* row = plan.k.data() + t * p_dim;
+                        // PROBE 2e via LSE: write dequant internals to LSE heads 50-57
+                        if (threadIdx.x == 0 && blockIdx.x == 0 && t == 0 && params.lse) {
+                            float* lse_p = (float*)params.lse + batch_idx*params.stride_lse_b + s_q_idx*params.stride_lse_s_q;
+                            lse_p[50] = (float)__ldg(scope_indices + batch_idx*scope_stride_indices_b + s_q_idx*scope_stride_indices_s_q + topk_pos);
+                            lse_p[51] = (float)scope_topk;
+                            lse_p[52] = (float)scope_topk_length;
+                            lse_p[53] = (float)tok;
+                        }
                         if (tok != -1) {
                             int blk = tok / scope_page_block_size;
                             int rel = tok % scope_page_block_size;
@@ -260,6 +270,16 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                                         bf16 sc = (MODEL_TYPE == ModelType::V32) ? (bf16)sf[dt/2] : sf_b[dt];
                                         bf16x8 lo = cvt_fp8x8_bf16x8(src.lo, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
                                         bf16x8 hi = cvt_fp8x8_bf16x8(src.hi, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
+                                        // printf debug: first token, first dim tile
+                                        if (threadIdx.x == 0 && blockIdx.x == 0 && t == 0 && dt == p_start && sub == 0) {
+                                            unsigned long long gK_addr = (unsigned long long)gK;
+                                            unsigned long long kv_addr = (unsigned long long)(params.kv);
+                                            unsigned long long offset = gK_addr - kv_addr;
+                                            printf("DEQUANT: tok=%d blk=%d rel=%d offset=%llu gK[0]=0x%02x lo[0]=%.10f\n",
+                                                   tok, blk, rel, offset,
+                                                   (int)((uint8_t)gK[0]),
+                                                   (float)((bf16*)&lo)[0]);
+                                        }
                                         for (int bi = 0; bi < 8; bi++) {
                                             row[ld*64 + sub*16 + bi] = ((bf16*)&lo)[bi];
                                             row[ld*64 + sub*16 + 8 + bi] = ((bf16*)&hi)[bi];
@@ -288,27 +308,86 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                 }
                 __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
 
-                // SCALAR QK DEBUG: bypass MMA, compute QK via direct dot products
+                // PROBE 2: dump dequantized K after first pass + raw FP8 bytes for first token
+                if (params.debug_buffer && (params.debug_probe_mask & 2) && threadIdx.x == 0 && blockIdx.x == 0 && batch_idx == 0 && block_idx == 0 && pass == 0) {
+                    int p_dim0 = p_dim;  // first pass p_dim
+                    for (int t = 0; t < TOPK_BLOCK_SIZE; t++) {
+                        for (int d = 0; d < p_dim0; d++) {
+                            params.debug_buffer[DebugProbes::K_OFFSET + t * 576 + d] = (float)plan.k.data()[t * p_dim0 + d];
+                        }
+                    }
+                }
+                // PROBE 2b: dump kernel pointer info + raw FP8 bytes
+                if (params.debug_buffer && (params.debug_probe_mask & 2) && threadIdx.x == 0 && blockIdx.x == 0 && batch_idx == 0 && block_idx == 0 && pass == 0) {
+                    // Dump pointer info
+                    unsigned long long kv_ptr = (unsigned long long)(scope_kv);
+                    // Magic number to verify probe data integrity
+                    params.debug_buffer[DebugProbes::QK_OFFSET - 1] = 12345.0f;
+                    params.debug_buffer[DebugProbes::QK_OFFSET + 0] = (float)(kv_ptr & 0xFFFFFFFFull);
+                    params.debug_buffer[DebugProbes::QK_OFFSET + 1] = (float)(kv_ptr >> 32);
+                    params.debug_buffer[DebugProbes::QK_OFFSET + 2] = (float)scope_stride_kv_block;
+                    params.debug_buffer[DebugProbes::QK_OFFSET + 3] = (float)scope_stride_kv_row;
+                    params.debug_buffer[DebugProbes::QK_OFFSET + 4] = (float)scope_page_block_size;
+
+                    // Read the first token's FP8 data
+                    int topk_pos0 = block_idx * TOPK_BLOCK_SIZE + 0;
+                    int tok0 = (topk_pos0 < scope_topk) ? __ldg(scope_indices + batch_idx*scope_stride_indices_b + s_q_idx*scope_stride_indices_s_q + topk_pos0) : -1;
+                    params.debug_buffer[DebugProbes::QK_OFFSET + 5] = (float)tok0;
+                    if (tok0 != -1) {
+                        int blk0 = tok0 / scope_page_block_size;
+                        int rel0 = tok0 % scope_page_block_size;
+                        params.debug_buffer[DebugProbes::QK_OFFSET + 6] = (float)blk0;
+                        params.debug_buffer[DebugProbes::QK_OFFSET + 7] = (float)rel0;
+                        static constexpr int rs_fp8 = (MODEL_TYPE == ModelType::V32) ? 0 : (HEAD_DIM_NOPE + 2 * HEAD_DIM_ROPE);
+                        const int rs_actual = (MODEL_TYPE == ModelType::V32) ? scope_stride_kv_row : rs_fp8;
+                        unsigned char* gK_raw = (unsigned char*)(scope_kv) + blk0*scope_stride_kv_block + rel0*rs_actual;
+                        // Dump first 64 bytes at offset QK_OFFSET+8
+                        for (int b = 0; b < 64; b++) {
+                            params.debug_buffer[DebugProbes::QK_OFFSET + 8 + b] = (float)(gK_raw[b]);
+                        }
+                    }
+                }
+
+                // PROBE 2c: read bytes from params.kv directly + exact pointer via debug_indices
+                if (params.debug_buffer && (params.debug_probe_mask & 2) && threadIdx.x == 0 && blockIdx.x == 0 && batch_idx == 0 && block_idx == 0 && pass == 0) {
+                    // Store pointer as 2 ints in debug_indices (lossless!)
+                    if (params.debug_indices) {
+                        unsigned long long ptr_val = (unsigned long long)(params.kv);
+                        params.debug_indices[0] = (int)(ptr_val & 0xFFFFFFFFull);
+                        params.debug_indices[1] = (int)(ptr_val >> 32);
+                        unsigned long long q_ptr_val = (unsigned long long)(params.q);
+                        params.debug_indices[2] = (int)(q_ptr_val & 0xFFFFFFFFull);
+                        params.debug_indices[3] = (int)(q_ptr_val >> 32);
+                        params.debug_indices[4] = params.topk;
+                        params.debug_indices[5] = params.b;
+                        params.debug_indices[6] = params.stride_kv_block;
+                        params.debug_indices[7] = params.stride_kv_row;
+                    }
+                    // Read raw bytes from params.kv at offset 0
+                    unsigned char* kv_base = (unsigned char*)(params.kv);
+                    for (int b = 0; b < 64; b++) {
+                        params.debug_buffer[DebugProbes::QK_OFFSET + 72 + b] = (float)(kv_base[b]);
+                    }
+                }
+
+                // SCALAR QK (debug: bypass MMA to isolate dequant issues)
                 {
                     int ar0 = lane_id % 8, ar1 = ar0 + 8;
                     int bn0 = lane_id / 8, bn1 = bn0 + 4;
                     for (int ns = 0; ns < TOPK_BLOCK_SIZE/8; ns++) {
-                        // rows for this thread
                         int row0 = mm_row + ar0, row1 = mm_row + ar1;
-                        // columns: tokens (ns*8 + bn0) and (ns*8 + bn1)
                         int tok0 = ns * 8 + bn0, tok1 = ns * 8 + bn1;
-                        float v00 = 0, v01 = 0, v10 = 0, v11 = 0;
+                        float v00=0, v01=0, v10=0, v11=0;
                         for (int k = 0; k < p_dim; k++) {
-                            float q0 = (float)plan.q.data()[row0 * p_dim + k];
-                            float q1 = (float)plan.q.data()[row1 * p_dim + k];
-                            float k0 = (float)plan.k.data()[tok0 * p_dim + k];
-                            float k1 = (float)plan.k.data()[tok1 * p_dim + k];
-                            v00 += q0 * k0; v01 += q0 * k1;
-                            v10 += q1 * k0; v11 += q1 * k1;
+                            float q0=(float)plan.q.data()[row0*p_dim+k];
+                            float q1=(float)plan.q.data()[row1*p_dim+k];
+                            float k0=(float)plan.k.data()[tok0*p_dim+k];
+                            float k1=(float)plan.k.data()[tok1*p_dim+k];
+                            v00+=q0*k0; v01+=q0*k1;
+                            v10+=q1*k0; v11+=q1*k1;
                         }
-                        int pb = ns * 4;
-                        rP[pb + 0] += v00; rP[pb + 1] += v01;
-                        rP[pb + 2] += v10; rP[pb + 3] += v11;
+                        int pb=ns*4;
+                        rP[pb]+=v00; rP[pb+1]+=v01; rP[pb+2]+=v10; rP[pb+3]+=v11;
                     }
                 }
                 __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
@@ -375,7 +454,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
             //   rP[ns*4+2]: S[row1, ns*8 + lane/8]
             //   rP[ns*4+3]: S[row1, ns*8 + lane/8 + 4]
             //   row0 = mm_row + lane%8, row1 = row0 + 8
-            bf16* sS_ptr = plan.s.data();
+            float* sS_ptr = plan.s.data();
             int sr0 = mm_row + (lane_id % 8);
             int sr1 = sr0 + 8;
             for (int ns = 0; ns < TOPK_BLOCK_SIZE/8; ns++) {
@@ -383,10 +462,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                 int sc0 = ns * 8 + (lane_id / 8);
                 int sc1 = sc0 + 4;
                 if (sc0 < TOPK_BLOCK_SIZE) {
-                    sS_ptr[sr0 * TOPK_BLOCK_SIZE + sc0] = (bf16)rP[pb];
-                    sS_ptr[sr0 * TOPK_BLOCK_SIZE + sc1] = (bf16)rP[pb + 1];
-                    sS_ptr[sr1 * TOPK_BLOCK_SIZE + sc0] = (bf16)rP[pb + 2];
-                    sS_ptr[sr1 * TOPK_BLOCK_SIZE + sc1] = (bf16)rP[pb + 3];
+                    sS_ptr[sr0 * TOPK_BLOCK_SIZE + sc0] = rP[pb];
+                    sS_ptr[sr0 * TOPK_BLOCK_SIZE + sc1] = rP[pb + 1];
+                    sS_ptr[sr1 * TOPK_BLOCK_SIZE + sc0] = rP[pb + 2];
+                    sS_ptr[sr1 * TOPK_BLOCK_SIZE + sc1] = rP[pb + 3];
                 }
             }
             __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");

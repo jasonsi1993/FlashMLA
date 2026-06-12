@@ -87,6 +87,7 @@ ext_modules.append(
             "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu",
 
             # sm120 sparse decode (SM80-MMA kernel)
+            "csrc/sm120/decode/sparse_fp8/debug.cu",
             "csrc/sm120/decode/sparse_fp8/instantiations/v32_h64.cu",
             "csrc/sm120/decode/sparse_fp8/instantiations/v32_h128.cu",
             "csrc/sm120/decode/sparse_fp8/instantiations/model1_h64.cu",

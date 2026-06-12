@@ -100,6 +100,11 @@ struct SparseAttnDecodeParams {
     DecodingSchedMeta* __restrict__ tile_scheduler_metadata_ptr; // [num_sm_parts, ], contiguous
     int* __restrict__ num_splits_ptr; // [batch_size+1, ], contiguous
     int num_sm_parts;
+
+    // Debug probes (set to non-null to enable)
+    float* __restrict__ debug_buffer;   // flexible debug output buffer
+    int* __restrict__ debug_indices;    // [topk] probe 1: token indices as seen by kernel
+    int debug_probe_mask;              // bitmask: 1=indices, 2=K, 4=V, 8=QK, 16=S, 32=O_pre
 };
 
 struct CombineParams {
