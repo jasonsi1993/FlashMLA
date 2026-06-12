@@ -494,10 +494,6 @@ sparse_attn_decode_interface(
     params.debug_probe_mask = sm120::decode::sparse_fp8::debug_is_enabled() ? 3 : 0;  // probes 1+2
 
     if (arch.is_sm120f()) {
-        // SM120: sync before kernel launch to ensure metadata kernel and any
-        // prior GPU operations complete.
-        cudaDeviceSynchronize();
-
         // Split large batches: params.b >= 4 in __grid_constant__ triggers
         // a CUDA 13 code-generation issue that produces NaN. Work around by
         // launching at most 2 batches per kernel invocation.
