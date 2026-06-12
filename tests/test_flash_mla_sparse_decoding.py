@@ -233,7 +233,33 @@ def test_flash_mla(p: TestParam) -> Result:
     return performance_result
 
 
+def _run_test_on_gpu(gpu_id, test_indices, all_testcases):
+    """Run a subset of tests on a specific GPU."""
+    import os, io, sys
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    import torch
+    torch.cuda.empty_cache()
+    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_device('cuda')
+    torch.set_float32_matmul_precision('high')
+
+    results = []
+    for idx in test_indices:
+        tc = all_testcases[idx]
+        try:
+            old_stdout = sys.stdout; sys.stdout = io.StringIO()
+            r = test_flash_mla(tc)
+            sys.stdout = old_stdout
+            results.append((idx, r.is_correct, None))
+        except Exception as e:
+            sys.stdout = old_stdout
+            results.append((idx, False, f'{type(e).__name__}: {str(e)[:60]}'))
+    return gpu_id, results
+
 def main():
+    import multiprocessing as mp
+    mp.set_start_method('spawn', force=True)
+
     dtype = torch.bfloat16
     device = torch.device("cuda:0")
     torch.set_default_dtype(dtype)
@@ -245,74 +271,39 @@ def main():
     raw_testcases = gen_testcase()
     testcases = [t.to_test_param() for t in raw_testcases]
 
-    print(f"{kk.colors['CYAN_BG']}{len(testcases)} testcases to run{kk.colors['CLEAR']}")
+    num_gpus = min(8, torch.cuda.device_count())
+    print(f"{kk.colors['CYAN_BG']}{len(testcases)} testcases to run on {num_gpus} GPUs{kk.colors['CLEAR']}")
 
-    is_no_cooldown = lib.is_no_cooldown()
-    num_testcases_len = len(str(len(testcases)))
+    # Distribute tests across GPUs (striped for load balance)
+    gpu_assignments = [[] for _ in range(num_gpus)]
+    for i in range(len(testcases)):
+        gpu_assignments[i % num_gpus].append(i)
+
+    # Run in parallel
+    with mp.Pool(num_gpus) as pool:
+        all_results = pool.starmap(_run_test_on_gpu,
+            [(gpu, indices, testcases) for gpu, indices in enumerate(gpu_assignments)])
+
+    # Merge results
+    merged = {}
+    for gpu_id, gpu_results in all_results:
+        for idx, is_correct, error in gpu_results:
+            merged[idx] = (is_correct, error)
+
     failed_cases = []
-    results: List[Tuple[TestParam, Result]] = []
-    for testcase_idx, testcase in enumerate(testcases):
-        if testcase != testcases[0] and testcase.num_runs > 0 and not is_no_cooldown:
-            time.sleep(0.3) # Cooldown
-        print(f"[{testcase_idx+1:{num_testcases_len}d}/{len(testcases)}, {testcase_idx/len(testcases)*100:3.0f}%]  ", end='')
-        result = test_flash_mla(testcase)
-        results.append((testcase, result))
-        if not result.is_correct:
-            failed_cases.append(testcase)
-            import sys
-            sys.exit(1)
+    for i in range(len(testcases)):
+        is_correct, error = merged[i]
+        if not is_correct:
+            failed_cases.append((testcases[i], error))
+            print(f"[{i+1}] FAIL: {error}" if error else f"[{i+1}] FAIL")
 
-    console = rich.console.Console(width=120)
-    table = rich.table.Table(show_header=True, header_style="bold cyan")
-    table.add_column("topk")
-    table.add_column("Bsz")
-    table.add_column("h_q&k")
-    table.add_column("sq")
-    table.add_column("sk")
-    table.add_column("d_qk")
-    table.add_column("Feats")
-    table.add_column("C/M")
-    table.add_column("TFlops")
-    table.add_column("GBps")
-    table.add_column("us")
-    table.add_column(" ")
-
-    for testcase, result in results:
-        assert testcase.decode
-        topk_str = f"{testcase.topk}" if testcase.decode.extra_topk is None else f"{testcase.topk}+{testcase.decode.extra_topk}"
-        table.add_row(
-            topk_str,
-            str(testcase.decode.b),
-            f"{testcase.h_q:3d} {testcase.h_kv}",
-            str(testcase.s_q),
-            str(testcase.s_kv),
-            str(testcase.d_qk),
-            " V"[testcase.decode.is_varlen] + " L"[testcase.have_topk_length] + " E"[testcase.decode.have_extra_topk_length],
-            f"{result.compute_memory_ratio:3.0f}",
-            f"{result.achieved_tflops:3.0f}",
-            f"{result.achieved_gBps:4.0f}",
-            f"{result.time_usage_per_us:4.1f}",
-            "" if result.is_correct else "X"
-        )
-    console.print(table)
-
-    def geomean(l) -> float:
-        import numpy
-        return numpy.exp(numpy.mean(numpy.log(l)))
-    
-    num_correct_testcases = [result.is_correct for t, result in results if t.check_correctness].count(True)
-    num_correctness_cases = sum([1 for t in testcases if t.check_correctness])
-    if num_correct_testcases == num_correctness_cases:
-        print(f"{kk.colors['GREEN_BG']}{num_correct_testcases}/{num_correctness_cases} correctness cases passed{kk.colors['CLEAR']}")
+    if failed_cases:
+        print(f"\n{len(failed_cases)}/{len(testcases)} FAILED:")
+        for tc, err in failed_cases[:20]:
+            print(f"  b={tc.decode.b} h={tc.h_q} topk={tc.topk} skv={tc.s_kv}: {err}")
+        import sys; sys.exit(1)
     else:
-        print(f"{kk.colors['RED_BG']}{num_correct_testcases}/{num_correctness_cases} correctness cases passed{kk.colors['CLEAR']}")
-        for t in failed_cases:
-            print(f"\t{t},")
-
-    valid_achieved_tflops = [result.achieved_tflops for _, result in results if result.achieved_tflops > 0.1]
-    if len(valid_achieved_tflops) > 0:
-        achieved_tflops_geomean = geomean(valid_achieved_tflops)    # > 0.1 to prune out correctness cases
-        print(f"TFlops     geomean: {achieved_tflops_geomean:.1f}")
+        print(f"\nAll {len(testcases)} tests PASSED")
     
 
 if __name__ == "__main__":
