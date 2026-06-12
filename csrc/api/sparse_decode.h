@@ -8,6 +8,7 @@
 #include "sm100/decode/head64/kernel.h"
 #include "sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
 #include "sm120/decode/sparse_fp8/kernel.h"
+#include "sm120/decode/sparse_fp8/debug.h"
 #include "smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
 #include "smxx/decode/combine/combine.h"
 
@@ -486,6 +487,11 @@ sparse_attn_decode_interface(
     params.stride_o_accum_split = int64_stride_to_int(o_accum.stride(0));
     params.stride_o_accum_s_q = int64_stride_to_int(o_accum.stride(1));
     params.stride_o_accum_h_q = int64_stride_to_int(o_accum.stride(2));
+
+    // Debug probe support: set debug buffer pointer if allocated
+    params.debug_buffer = sm120::decode::sparse_fp8::debug_get_ptr();
+    params.debug_indices = sm120::decode::sparse_fp8::debug_get_indices_ptr();
+    params.debug_probe_mask = sm120::decode::sparse_fp8::debug_is_enabled() ? 3 : 0;  // probes 1+2
 
     if (arch.is_sm120f()) {
         // SM120: sync before kernel launch to ensure metadata kernel and any

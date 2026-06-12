@@ -73,7 +73,7 @@ struct SharedMemoryPlan {
         };
         array_aligned<bf16, cosize_v<SmemLayoutOBuf>> oBuf;    // 64KB
     };
-    CUTE_ALIGNAS(1024) array_aligned<bf16, cosize_v<SmemLayoutS>> s;  // 8KB
+    CUTE_ALIGNAS(1024) array_aligned<float, cosize_v<SmemLayoutS>> s;  // 16KB (FP32 for precision)
     bool is_kv_valid[TOPK_BLOCK_SIZE];
 
     float sM[BLOCK_M], sL[BLOCK_M], sScale[BLOCK_M], sOScale[BLOCK_M];
