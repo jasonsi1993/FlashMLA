@@ -184,18 +184,6 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                 }
                 __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
 
-                // PROBE 1: dump indices as seen by kernel
-                if (params.debug_buffer && (params.debug_probe_mask & 1) && threadIdx.x == 0 && blockIdx.x == 0 && batch_idx == 0 && block_idx == 0) {
-                    for (int i = 0; i < TOPK_BLOCK_SIZE; i++) {
-                        int topk_pos = block_idx * TOPK_BLOCK_SIZE + i;
-                        int tok = (topk_pos < scope_topk) ? __ldg(gIdx + i) : -1;
-                        int valid = (topk_pos < scope_topk_length) && (tok != -1);
-                        params.debug_buffer[DebugProbes::IDX_OFFSET + i*2] = (float)tok;
-                        params.debug_buffer[DebugProbes::IDX_OFFSET + i*2 + 1] = (float)valid;
-                    }
-                }
-                __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
-
             // rP: 64 floats per thread for QK(16x64): 64/8=8 N-steps x 8 vals = 64?
             // Actually each mma.sync produces 4 floats per thread covering 16x8.
             // 8 N-steps x 4 = 32 floats per thread for 64 cols.
@@ -243,6 +231,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                             int blk = tok / scope_page_block_size;
                             int rel = tok % scope_page_block_size;
                             fp8* gK = scope_kv + blk*scope_stride_kv_block + rel*rs;
+                            const uint8_t* gK_bytes = reinterpret_cast<const uint8_t*>(gK);
                             union { float sf_f32[4]; bf16 sf_bf16[8]; } sf_union;
                             if constexpr (MODEL_TYPE == ModelType::V32) {
                                 for (int si=0; si<4; si++)
@@ -270,9 +259,13 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                                     #pragma unroll 1  // don't unroll to reduce register pressure
                                     for (int sub = 0; sub < 4; sub++) {
                                         fp8x16 src;
+                                        // Load the FP8 cache as raw bytes.  Reading through the
+                                        // cutlass::float_e4m3_t typed pointer converts the FP8 value
+                                        // numerically (e.g. 0x71 -> 144 -> 0x90) instead of copying
+                                        // its encoded byte, which scrambles signs and magnitudes.
                                         for (int bi=0; bi<8; bi++) {
-                                            ((uint8_t*)&src.lo)[bi] = gK[dt*64 + sub*16 + bi];
-                                            ((uint8_t*)&src.hi)[bi] = gK[dt*64 + sub*16 + 8 + bi];
+                                            ((uint8_t*)&src.lo)[bi] = gK_bytes[dt*64 + sub*16 + bi];
+                                            ((uint8_t*)&src.hi)[bi] = gK_bytes[dt*64 + sub*16 + 8 + bi];
                                         }
                                         bf16 sc = (MODEL_TYPE == ModelType::V32) ? (bf16)sf[dt/2] : sf_b[dt];
                                         bf16x8 lo = cvt_fp8x8_bf16x8(src.lo, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
@@ -496,6 +489,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                             static constexpr int TSV = (MODEL_TYPE == ModelType::V32) ? 0 : (HEAD_DIM_NOPE + 2 * HEAD_DIM_ROPE);
                             const int rsv = (MODEL_TYPE == ModelType::V32) ? scope_stride_kv_row : TSV;
                             fp8* gK = scope_kv + blk*scope_stride_kv_block + rel*rsv;
+                            const uint8_t* gK_bytes = reinterpret_cast<const uint8_t*>(gK);
                             union { float sf_f32[4]; bf16 sf_bf16[8]; } sf_union_v;
                             if constexpr (MODEL_TYPE==ModelType::V32)
                                 for (int si=0; si<4; si++) sf_union_v.sf_f32[si] = ((const float*)(gK + HEAD_DIM_NOPE))[si];
@@ -531,8 +525,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                                     }
                                 }
                                 fp8x16 src;
-                                *reinterpret_cast<uint2*>(&src.lo) = *reinterpret_cast<const uint2*>(gK + vd);
-                                *reinterpret_cast<uint2*>(&src.hi) = *reinterpret_cast<const uint2*>(gK + vd + 8);
+                                *reinterpret_cast<uint2*>(&src.lo) = *reinterpret_cast<const uint2*>(gK_bytes + vd);
+                                *reinterpret_cast<uint2*>(&src.hi) = *reinterpret_cast<const uint2*>(gK_bytes + vd + 8);
                                 bf16 sc = (vd/QUANT_TILE_SIZE < NUM_SCALES) ? ((MODEL_TYPE==ModelType::V32) ? (bf16)sf_v[vd/QUANT_TILE_SIZE] : sf_vb[vd/QUANT_TILE_SIZE]) : (bf16)1.0f;
                                 bf16x8 lo = cvt_fp8x8_bf16x8(src.lo, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
                                 bf16x8 hi = cvt_fp8x8_bf16x8(src.hi, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
