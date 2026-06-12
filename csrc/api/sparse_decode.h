@@ -404,6 +404,11 @@ sparse_attn_decode_interface(
     }
 
     DecodeImplMeta impl_meta = impl->get_meta(h_q, s_q);
+    if (arch.is_sm120f()) {
+        // SM120 does not use impl beyond get_meta; free it immediately.
+        delete impl;
+        impl = nullptr;
+    }
 
     SparseAttnDecodeParams params = {
         b, s_q, h_q, h_kv, d_qk, d_v,
@@ -560,6 +565,7 @@ sparse_attn_decode_interface(
         smxx::decode::run_flash_mla_combine_kernel<bf16>(combine_params);
 
         delete impl;
+        impl = nullptr;
     }
 
     return {out, lse.transpose(1, 2), tile_scheduler_metadata, num_splits};
