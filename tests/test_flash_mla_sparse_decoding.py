@@ -191,7 +191,7 @@ def test_flash_mla(p: TestParam) -> Result:
         def have_kernel(name: str):
             return kernel_time_usages_us[name] is not None
         
-        if kk.is_using_profiling_tools():
+        if kk.is_using_profiling_tools() or result.is_using_nsys:
             e2e_time_usage_us = 1e6
         else:
             assert have_kernel(splitkv_kernel_name)
