@@ -7,6 +7,8 @@
 #include "sm90/decode/sparse_fp8/splitkv_mla.h"
 #include "sm100/decode/head64/kernel.h"
 #include "sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
+#include "sm120/decode/sparse_fp8/kernel.h"
+#include "sm120/decode/sparse_fp8/debug.h"
 #include "smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
 #include "smxx/decode/combine/combine.h"
 
@@ -58,8 +60,14 @@ class Decode_Sm90_Impl : public DecodeImplBase {
 public:
     DecodeImplMeta get_meta(int h_q, int s_q) override {
         Arch arch = Arch();
+        int num_sm_parts = std::max(arch.num_sms / s_q / (h_q/64), 1);
+        // SM120 has only 99KB shared memory per block; force no-split mode
+        // to use oBuf (64KB) instead of oAccumBuf (128KB)
+        if (arch.is_sm120f()) {
+            num_sm_parts = 1;
+        }
         return {
-            std::max(arch.num_sms / s_q / (h_q/64), 1),
+            num_sm_parts,
             5,
             64
         };
@@ -108,7 +116,7 @@ protected:
 
 
 // An implementation that calls the head64 kernel twice to process head128
-// Necessary for running V3.2 shape (i.e. h = 128, d_qk = 576) on SM100f
+// Necessary for running V3.2 shape (i.e. h = 128, d_qk = 576) on SM100f and SM120f
 class Decode_Sm100_Head64x2_Impl : public DecodeImplBase {
     DECLARE_SUPPORTED_FEATURES(
         DecodeFeatures::HEAD_128,
@@ -360,7 +368,21 @@ sparse_attn_decode_interface(
     }
 
     DecodeImplBase* impl;
-    if (arch.is_sm100f()) {
+    if (arch.is_sm120f()) {
+        // SM120 uses SM80-MMA kernel — dummy impl to satisfy the framework
+        struct Sm120DummyImpl : public DecodeImplBase {
+            DecodeImplMeta get_meta(int, int) override {
+                return {1, 0, 64};  // no-split, no scheduler overhead
+            }
+        protected:
+            void run_(const SparseAttnDecodeParams&, const std::vector<FeatureT>&) override {}
+            std::span<const FeatureT> get_supported_features() const override {
+                static const FeatureT f[1] = {};
+                return std::span<const FeatureT>(f, 0);
+            }
+        };
+        impl = new Sm120DummyImpl();
+    } else if (arch.is_sm100f()) {
         if (h_q == 64) {
             impl = new Decode_Sm100_Head64_Impl();
         } else if (h_q == 128) {
@@ -375,6 +397,7 @@ sparse_attn_decode_interface(
             TORCH_CHECK(false, "Unsupported h_q: ", h_q);
         }
     } else if (arch.is_sm90a()) {
+        // SM90 kernels use GMMA instructions which compile for SM120
         impl = new Decode_Sm90_Impl();
     } else {
         TORCH_CHECK(false, "Unsupported architecture for sparse decode fwd");
@@ -465,31 +488,83 @@ sparse_attn_decode_interface(
     params.stride_o_accum_s_q = int64_stride_to_int(o_accum.stride(1));
     params.stride_o_accum_h_q = int64_stride_to_int(o_accum.stride(2));
 
-    impl->run(params, features);
-    
-    CombineParams combine_params = {
-        b, s_q, h_q, d_v,
+    // Debug probe support: set debug buffer pointer if allocated
+    params.debug_buffer = sm120::decode::sparse_fp8::debug_get_ptr();
+    params.debug_indices = sm120::decode::sparse_fp8::debug_get_indices_ptr();
+    params.debug_probe_mask = sm120::decode::sparse_fp8::debug_is_enabled() ? 3 : 0;  // probes 1+2
 
-        params.lse,
-        params.out,
-        params.stride_lse_b, params.stride_lse_s_q,
-        params.stride_o_b, params.stride_o_s_q, params.stride_o_h_q,
+    if (arch.is_sm120f()) {
+        // SM120: sync before kernel launch to ensure metadata kernel and any
+        // prior GPU operations complete.
+        cudaDeviceSynchronize();
 
-        params.lse_accum,
-        params.o_accum,
-        params.stride_lse_accum_split, params.stride_lse_accum_s_q,
-        params.stride_o_accum_split, params.stride_o_accum_s_q, params.stride_o_accum_h_q,
+        // Split large batches: params.b >= 4 in __grid_constant__ triggers
+        // a CUDA 13 code-generation issue that produces NaN. Work around by
+        // launching at most 2 batches per kernel invocation.
+        static constexpr int SM120_MAX_B = 2;
+        for (int batch_start = 0; batch_start < b; batch_start += SM120_MAX_B) {
+            int cur_b = std::min(SM120_MAX_B, b - batch_start);
+            SparseAttnDecodeParams cur_params = params;
+            cur_params.b = cur_b;
+            cur_params.q += batch_start * params.stride_q_b;
+            cur_params.indices += batch_start * params.stride_indices_b;
+            if (cur_params.topk_length != nullptr) {
+                cur_params.topk_length += batch_start;
+            }
+            if (cur_params.extra_indices != nullptr) {
+                cur_params.extra_indices += batch_start * params.stride_extra_indices_b;
+            }
+            if (cur_params.extra_topk_length != nullptr) {
+                cur_params.extra_topk_length += batch_start;
+            }
+            cur_params.lse += batch_start * params.stride_lse_b;
+            cur_params.out += batch_start * params.stride_o_b;
 
-        params.tile_scheduler_metadata_ptr,
-        params.num_splits_ptr,
-        params.num_sm_parts,
+            if (model_type == ModelType::V32) {
+                if (h_q == 64) {
+                    sm120::decode::sparse_fp8::run_sm120_sparse_decode_kernel<ModelType::V32, 64>(cur_params);
+                } else if (h_q == 128) {
+                    sm120::decode::sparse_fp8::run_sm120_sparse_decode_kernel<ModelType::V32, 128>(cur_params);
+                } else {
+                    TORCH_CHECK(false, "Unsupported h_q for SM120 sparse decode: ", h_q);
+                }
+            } else {
+                if (h_q == 64) {
+                    sm120::decode::sparse_fp8::run_sm120_sparse_decode_kernel<ModelType::MODEL1, 64>(cur_params);
+                } else if (h_q == 128) {
+                    sm120::decode::sparse_fp8::run_sm120_sparse_decode_kernel<ModelType::MODEL1, 128>(cur_params);
+                } else {
+                    TORCH_CHECK(false, "Unsupported h_q for SM120 sparse decode: ", h_q);
+                }
+            }
+        }
+    } else {
+        impl->run(params, features);
 
-        ku::get_optional_tensor_ptr<float>(attn_sink),
-        at::cuda::getCurrentCUDAStream().stream()
-    };
-    smxx::decode::run_flash_mla_combine_kernel<bf16>(combine_params);
+        CombineParams combine_params = {
+            b, s_q, h_q, d_v,
 
-    delete impl;
+            params.lse,
+            params.out,
+            params.stride_lse_b, params.stride_lse_s_q,
+            params.stride_o_b, params.stride_o_s_q, params.stride_o_h_q,
+
+            params.lse_accum,
+            params.o_accum,
+            params.stride_lse_accum_split, params.stride_lse_accum_s_q,
+            params.stride_o_accum_split, params.stride_o_accum_s_q, params.stride_o_accum_h_q,
+
+            params.tile_scheduler_metadata_ptr,
+            params.num_splits_ptr,
+            params.num_sm_parts,
+
+            ku::get_optional_tensor_ptr<float>(attn_sink),
+            at::cuda::getCurrentCUDAStream().stream()
+        };
+        smxx::decode::run_flash_mla_combine_kernel<bf16>(combine_params);
+
+        delete impl;
+    }
 
     return {out, lse.transpose(1, 2), tile_scheduler_metadata, num_splits};
 }

@@ -229,6 +229,7 @@ def generate_testcase_for_decode(t: TestParam) -> TestcaseForDecode:
     assert t.h_q % t.h_kv == 0
     assert t.decode is not None
 
+    torch.cuda.empty_cache()  # prevent cross-test memory allocator contamination
     q = torch.randn((t.decode.b, t.s_q, t.h_q, t.d_qk))
     q.clamp_(min=-1.0, max=1.0)
 
@@ -318,7 +319,8 @@ def run_flash_mla_sparse_fwd(p: TestParam, t: Testcase, return_p_sum: bool):
 
 def run_flash_mla_decode(p: TestParam, t: TestcaseForDecode, tile_scheduler_metadata, num_splits):
     assert p.decode is not None
-    return flash_mla.flash_mla_with_kvcache(
+    torch.cuda.synchronize()  # ensure metadata kernel + all prior GPU ops complete
+    result = flash_mla.flash_mla_with_kvcache(
         t.q,
         t.kv_scope.get_kvcache_for_flash_mla(),
         None, None, p.d_v,
@@ -332,6 +334,8 @@ def run_flash_mla_decode(p: TestParam, t: TestcaseForDecode, tile_scheduler_meta
         t.kv_scope.topk_length,
         t.extra_kv_scope.topk_length if t.extra_kv_scope is not None and t.extra_kv_scope.topk_length is not None else None
     )
+    torch.cuda.synchronize()  # ensure decode kernel completes
+    return result
 
 
 @dataclasses.dataclass
