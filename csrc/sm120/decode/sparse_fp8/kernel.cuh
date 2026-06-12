@@ -149,6 +149,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
         // O accumulator: 16 rows x 512 cols per warp, 4 floats per 16x8 mma tile = 256 floats/thread
         float rO[256]; for (int i = 0; i < 256; i++) rO[i] = 0.0f;
         int num_scopes = (params.extra_kv != nullptr) ? 2 : 1;
+        if (threadIdx.x == 0 && blockIdx.x == 0) {
+            printf("SCOPES: num=%d extra_kv=%p extra_topk=%d extra_indices=%p\n",
+                   num_scopes, (void*)params.extra_kv, params.extra_topk, (void*)params.extra_indices);
+        }
         for (int scope_idx = 0; scope_idx < num_scopes; scope_idx++) {
             const bool is_extra_scope = (scope_idx != 0);
             int scope_topk = is_extra_scope ? params.extra_topk : smem_topk;
@@ -183,7 +187,6 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                     plan.is_kv_valid[i] = (topk_pos < scope_topk_length) && (tok != -1);
                 }
                 __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
-
                 // PROBE 1: dump indices as seen by kernel
                 if (params.debug_buffer && (params.debug_probe_mask & 1) && threadIdx.x == 0 && blockIdx.x == 0 && batch_idx == 0 && block_idx == 0) {
                     for (int i = 0; i < TOPK_BLOCK_SIZE; i++) {
@@ -243,6 +246,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                             int blk = tok / scope_page_block_size;
                             int rel = tok % scope_page_block_size;
                             fp8* gK = scope_kv + blk*scope_stride_kv_block + rel*rs;
+                            const uint8_t* gK_bytes = reinterpret_cast<const uint8_t*>(gK);
                             union { float sf_f32[4]; bf16 sf_bf16[8]; } sf_union;
                             if constexpr (MODEL_TYPE == ModelType::V32) {
                                 for (int si=0; si<4; si++)
@@ -270,9 +274,13 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                                     #pragma unroll 1  // don't unroll to reduce register pressure
                                     for (int sub = 0; sub < 4; sub++) {
                                         fp8x16 src;
+                                        // Load the FP8 cache as raw bytes.  Reading through the
+                                        // cutlass::float_e4m3_t typed pointer converts the FP8 value
+                                        // numerically (e.g. 0x71 -> 144 -> 0x90) instead of copying
+                                        // its encoded byte, which scrambles signs and magnitudes.
                                         for (int bi=0; bi<8; bi++) {
-                                            ((uint8_t*)&src.lo)[bi] = gK[dt*64 + sub*16 + bi];
-                                            ((uint8_t*)&src.hi)[bi] = gK[dt*64 + sub*16 + 8 + bi];
+                                            ((uint8_t*)&src.lo)[bi] = gK_bytes[dt*64 + sub*16 + bi];
+                                            ((uint8_t*)&src.hi)[bi] = gK_bytes[dt*64 + sub*16 + 8 + bi];
                                         }
                                         bf16 sc = (MODEL_TYPE == ModelType::V32) ? (bf16)sf[dt/2] : sf_b[dt];
                                         bf16x8 lo = cvt_fp8x8_bf16x8(src.lo, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
@@ -377,24 +385,45 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                     }
                 }
 
-                // SCALAR QK (debug: bypass MMA to isolate dequant issues)
+                // QK MMA via SM80 m16n8k16 (same as pv_mma_kernel pattern)
                 {
+                    bf16* sQ_ptr = plan.q.data();
+                    bf16* sK_ptr = plan.k.data();
                     int ar0 = lane_id % 8, ar1 = ar0 + 8;
+                    int a_col = (lane_id / 8) * 2;
+                    int bk0 = lane_id % 8, bk1 = bk0 + 8;
                     int bn0 = lane_id / 8, bn1 = bn0 + 4;
-                    for (int ns = 0; ns < TOPK_BLOCK_SIZE/8; ns++) {
-                        int row0 = mm_row + ar0, row1 = mm_row + ar1;
-                        int tok0 = ns * 8 + bn0, tok1 = ns * 8 + bn1;
-                        float v00=0, v01=0, v10=0, v11=0;
-                        for (int k = 0; k < p_dim; k++) {
-                            float q0=(float)plan.q.data()[row0*p_dim+k];
-                            float q1=(float)plan.q.data()[row1*p_dim+k];
-                            float k0=(float)plan.k.data()[tok0*p_dim+k];
-                            float k1=(float)plan.k.data()[tok1*p_dim+k];
-                            v00+=q0*k0; v01+=q0*k1;
-                            v10+=q1*k0; v11+=q1*k1;
+
+                    for (int ks = 0; ks < p_dim/16; ks++) {
+                        unsigned a_regs[4];
+                        for (int g = 0; g < 2; g++) {
+                            int r = (g == 0) ? ar0 : ar1;
+                            bf16* q_row = sQ_ptr + (mm_row + r) * p_dim + ks * 16;
+                            ((bf16*)&a_regs[g*2])[0]   = q_row[a_col];
+                            ((bf16*)&a_regs[g*2])[1]   = q_row[a_col + 1];
+                            ((bf16*)&a_regs[g*2+1])[0] = q_row[a_col + 8];
+                            ((bf16*)&a_regs[g*2+1])[1] = q_row[a_col + 9];
                         }
-                        int pb=ns*4;
-                        rP[pb]+=v00; rP[pb+1]+=v01; rP[pb+2]+=v10; rP[pb+3]+=v11;
+
+                        for (int ns = 0; ns < TOPK_BLOCK_SIZE/8; ns++) {
+                            unsigned b_regs[2];
+                            bf16* k_row0 = sK_ptr + (ns * 8 + bn0) * p_dim + ks * 16;
+                            bf16* k_row1 = sK_ptr + (ns * 8 + bn1) * p_dim + ks * 16;
+                            ((bf16*)&b_regs[0])[0] = k_row0[bk0];
+                            ((bf16*)&b_regs[0])[1] = k_row0[bk1];
+                            ((bf16*)&b_regs[1])[0] = k_row1[bk0];
+                            ((bf16*)&b_regs[1])[1] = k_row1[bk1];
+
+                            int pb = ns * 4;
+                            float c[4] = {rP[pb], rP[pb+1], rP[pb+2], rP[pb+3]};
+                            asm volatile(
+                                "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                                : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                                : "r"(a_regs[0]), "r"(a_regs[1]), "r"(a_regs[2]), "r"(a_regs[3]),
+                                  "r"(b_regs[0]), "r"(b_regs[1]));
+                            rP[pb] = c[0]; rP[pb+1] = c[1]; rP[pb+2] = c[2]; rP[pb+3] = c[3];
+                        }
                     }
                 }
                 __threadfence_block(); __syncthreads(); asm volatile("" ::: "memory");
@@ -496,6 +525,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                             static constexpr int TSV = (MODEL_TYPE == ModelType::V32) ? 0 : (HEAD_DIM_NOPE + 2 * HEAD_DIM_ROPE);
                             const int rsv = (MODEL_TYPE == ModelType::V32) ? scope_stride_kv_row : TSV;
                             fp8* gK = scope_kv + blk*scope_stride_kv_block + rel*rsv;
+                            const uint8_t* gK_bytes = reinterpret_cast<const uint8_t*>(gK);
                             union { float sf_f32[4]; bf16 sf_bf16[8]; } sf_union_v;
                             if constexpr (MODEL_TYPE==ModelType::V32)
                                 for (int si=0; si<4; si++) sf_union_v.sf_f32[si] = ((const float*)(gK + HEAD_DIM_NOPE))[si];
@@ -531,8 +561,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                                     }
                                 }
                                 fp8x16 src;
-                                *reinterpret_cast<uint2*>(&src.lo) = *reinterpret_cast<const uint2*>(gK + vd);
-                                *reinterpret_cast<uint2*>(&src.hi) = *reinterpret_cast<const uint2*>(gK + vd + 8);
+                                *reinterpret_cast<uint2*>(&src.lo) = *reinterpret_cast<const uint2*>(gK_bytes + vd);
+                                *reinterpret_cast<uint2*>(&src.hi) = *reinterpret_cast<const uint2*>(gK_bytes + vd + 8);
                                 bf16 sc = (vd/QUANT_TILE_SIZE < NUM_SCALES) ? ((MODEL_TYPE==ModelType::V32) ? (bf16)sf_v[vd/QUANT_TILE_SIZE] : sf_vb[vd/QUANT_TILE_SIZE]) : (bf16)1.0f;
                                 bf16x8 lo = cvt_fp8x8_bf16x8(src.lo, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
                                 bf16x8 hi = cvt_fp8x8_bf16x8(src.hi, __bfloat162bfloat162(*(__nv_bfloat16*)&sc));
