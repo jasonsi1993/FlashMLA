@@ -499,44 +499,22 @@ sparse_attn_decode_interface(
     params.debug_probe_mask = sm120::decode::sparse_fp8::debug_is_enabled() ? 3 : 0;  // probes 1+2
 
     if (arch.is_sm120f()) {
-        // Split large batches: params.b >= 4 in __grid_constant__ triggers
-        // a CUDA 13 code-generation issue that produces NaN. Work around by
-        // launching at most 2 batches per kernel invocation.
-        static constexpr int SM120_MAX_B = 2;
-        for (int batch_start = 0; batch_start < b; batch_start += SM120_MAX_B) {
-            int cur_b = std::min(SM120_MAX_B, b - batch_start);
-            SparseAttnDecodeParams cur_params = params;
-            cur_params.b = cur_b;
-            cur_params.q += batch_start * params.stride_q_b;
-            cur_params.indices += batch_start * params.stride_indices_b;
-            if (cur_params.topk_length != nullptr) {
-                cur_params.topk_length += batch_start;
-            }
-            if (cur_params.extra_indices != nullptr) {
-                cur_params.extra_indices += batch_start * params.stride_extra_indices_b;
-            }
-            if (cur_params.extra_topk_length != nullptr) {
-                cur_params.extra_topk_length += batch_start;
-            }
-            cur_params.lse += batch_start * params.stride_lse_b;
-            cur_params.out += batch_start * params.stride_o_b;
-
-            if (model_type == ModelType::V32) {
-                if (h_q == 64) {
-                    sm120::decode::sparse_fp8::run_sm120_sparse_decode_kernel<ModelType::V32, 64>(cur_params);
-                } else if (h_q == 128) {
-                    sm120::decode::sparse_fp8::run_sm120_sparse_decode_kernel<ModelType::V32, 128>(cur_params);
-                } else {
-                    TORCH_CHECK(false, "Unsupported h_q for SM120 sparse decode: ", h_q);
-                }
+        // Launch a single kernel with the full batch.
+        if (model_type == ModelType::V32) {
+            if (h_q == 64) {
+                sm120::decode::sparse_fp8::run_sm120_sparse_decode_kernel<ModelType::V32, 64>(params);
+            } else if (h_q == 128) {
+                sm120::decode::sparse_fp8::run_sm120_sparse_decode_kernel<ModelType::V32, 128>(params);
             } else {
-                if (h_q == 64) {
-                    sm120::decode::sparse_fp8::run_sm120_sparse_decode_kernel<ModelType::MODEL1, 64>(cur_params);
-                } else if (h_q == 128) {
-                    sm120::decode::sparse_fp8::run_sm120_sparse_decode_kernel<ModelType::MODEL1, 128>(cur_params);
-                } else {
-                    TORCH_CHECK(false, "Unsupported h_q for SM120 sparse decode: ", h_q);
-                }
+                TORCH_CHECK(false, "Unsupported h_q for SM120 sparse decode: ", h_q);
+            }
+        } else {
+            if (h_q == 64) {
+                sm120::decode::sparse_fp8::run_sm120_sparse_decode_kernel<ModelType::MODEL1, 64>(params);
+            } else if (h_q == 128) {
+                sm120::decode::sparse_fp8::run_sm120_sparse_decode_kernel<ModelType::MODEL1, 128>(params);
+            } else {
+                TORCH_CHECK(false, "Unsupported h_q for SM120 sparse decode: ", h_q);
             }
         }
     } else {
