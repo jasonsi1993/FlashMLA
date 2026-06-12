@@ -238,14 +238,14 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                         if (tok != -1) {
                             int blk = tok / scope_page_block_size;
                             int rel = tok % scope_page_block_size;
-                            fp8* gK = scope_kv + blk*scope_stride_kv_block + rel*rs;
+                            fp8* gK = scope_kv + (size_t)blk*scope_stride_kv_block + rel*rs;
                             const uint8_t* gK_bytes = reinterpret_cast<const uint8_t*>(gK);
                             union { float sf_f32[4]; bf16 sf_bf16[8]; } sf_union;
                             if constexpr (MODEL_TYPE == ModelType::V32) {
                                 for (int si=0; si<4; si++)
                                     sf_union.sf_f32[si] = __ldg((const float*)(gK + HEAD_DIM_NOPE) + si);
                             } else {
-                                uint8_t* bsc = (uint8_t*)(scope_kv + blk*scope_stride_kv_block)
+                                uint8_t* bsc = (uint8_t*)(scope_kv + (size_t)blk*scope_stride_kv_block)
                                              + scope_page_block_size * TSTRIDE;
                                 fp8_e8m0* se8 = (fp8_e8m0*)(bsc + rel * NUM_SCALES);
                                 for (int si=0; si<NUM_SCALES; si+=2) {
@@ -445,14 +445,14 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                             int rel = tok % scope_page_block_size;
                             static constexpr int TSV = (MODEL_TYPE == ModelType::V32) ? 0 : (HEAD_DIM_NOPE + 2 * HEAD_DIM_ROPE);
                             const int rsv = (MODEL_TYPE == ModelType::V32) ? scope_stride_kv_row : TSV;
-                            fp8* gK = scope_kv + blk*scope_stride_kv_block + rel*rsv;
+                            fp8* gK = scope_kv + (size_t)blk*scope_stride_kv_block + rel*rsv;
                             const uint8_t* gK_bytes = reinterpret_cast<const uint8_t*>(gK);
                             union { float sf_f32[4]; bf16 sf_bf16[8]; } sf_union_v;
                             if constexpr (MODEL_TYPE==ModelType::V32)
                                 for (int si=0; si<4; si++) sf_union_v.sf_f32[si] = ((const float*)(gK + HEAD_DIM_NOPE))[si];
                             else {
                                 static constexpr int TS2 = HEAD_DIM_NOPE + 2 * HEAD_DIM_ROPE;
-                                uint8_t* bsc2 = (uint8_t*)(scope_kv + blk*scope_stride_kv_block)
+                                uint8_t* bsc2 = (uint8_t*)(scope_kv + (size_t)blk*scope_stride_kv_block)
                                                + scope_page_block_size * TS2;
                                 fp8_e8m0* se2 = (fp8_e8m0*)(bsc2 + rel * NUM_SCALES);
                                 for (int si=0; si<NUM_SCALES; si+=2) {
@@ -582,8 +582,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
 
 template<ModelType MODEL_TYPE, int NUM_HEADS, typename TMAParams>
 __global__ void sm120_global_kernel(
-    __grid_constant__ const SparseAttnDecodeParams params,
-    __grid_constant__ const TMAParams tma_params)
+    const SparseAttnDecodeParams params,
+    const TMAParams tma_params)
 {
     KernelTemplate<MODEL_TYPE, NUM_HEADS>::template devfunc<TMAParams>(params, tma_params);
 }
