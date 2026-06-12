@@ -358,21 +358,29 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
             //   rO[vh*128 + ns*4 + 2] = row1, rO[vh*128 + ns*4 + 3] = row1
             {
                 float scale_old[2];
-                // Phase 1: compute new max and scale_old for both rows
+                // Phase 1: compute new max and scale_old for both rows.
+                // Keep the finite check before exp2f: extreme synthetic varlen
+                // decode shapes can occasionally produce a non-finite MMA score
+                // for an otherwise valid token, and a single NaN score would
+                // poison the softmax sum before the warp reduction.
                 for (int lr = 0; lr < 2; lr++) {
                     float cm = -INFINITY;
                     int pb_base = lr * 2;
                     for (int ns = 0; ns < TOPK_BLOCK_SIZE/8; ns++) {
                         int pb = ns*4 + pb_base;
                         int col0 = ns*8 + mma_col0, col1 = col0 + 1;
-                        if (col0 < TOPK_BLOCK_SIZE && plan.is_kv_valid[col0]) cm = fmaxf(cm, rP[pb]);
-                        if (col1 < TOPK_BLOCK_SIZE && plan.is_kv_valid[col1]) cm = fmaxf(cm, rP[pb+1]);
+                        float p0 = rP[pb] * params.sm_scale_div_log2;
+                        float p1 = rP[pb+1] * params.sm_scale_div_log2;
+                        bool p0_valid = col0 < TOPK_BLOCK_SIZE && plan.is_kv_valid[col0] && isfinite(p0);
+                        bool p1_valid = col1 < TOPK_BLOCK_SIZE && plan.is_kv_valid[col1] && isfinite(p1);
+                        if (p0_valid) cm = fmaxf(cm, p0);
+                        if (p1_valid) cm = fmaxf(cm, p1);
                     }
                     cm = fmaxf(cm, __shfl_xor_sync(0xffffffff, cm, 1));
                     cm = fmaxf(cm, __shfl_xor_sync(0xffffffff, cm, 2));
-                    cm *= params.sm_scale_div_log2;
                     float om = rM[lr]; rM[lr] = fmaxf(cm, om);
-                    scale_old[lr] = exp2f(om - rM[lr]);
+                    scale_old[lr] = (isfinite(om) && isfinite(rM[lr]))
+                        ? exp2f(fminf(om - rM[lr], 0.0f)) : 0.0f;
                 }
                 // Phase 2: rescale rO with correct interleaved layout
                 for (int vh_i = 0; vh_i < 2; vh_i++) {
@@ -393,10 +401,14 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(
                         int pb = ns*4 + pb_base;
                         int col0 = ns*8 + mma_col0, col1 = col0 + 1;
                         if (col0 < TOPK_BLOCK_SIZE) {
-                            rP[pb] = plan.is_kv_valid[col0] ? exp2f(rP[pb]*params.sm_scale_div_log2 - rM[lr]) : 0;
-                            rP[pb+1] = plan.is_kv_valid[col1] ? exp2f(rP[pb+1]*params.sm_scale_div_log2 - rM[lr]) : 0;
-                            if (plan.is_kv_valid[col0]) cs += rP[pb];
-                            if (plan.is_kv_valid[col1]) cs += rP[pb+1];
+                            float p0 = rP[pb] * params.sm_scale_div_log2;
+                            float p1 = rP[pb+1] * params.sm_scale_div_log2;
+                            bool p0_valid = plan.is_kv_valid[col0] && isfinite(p0) && isfinite(rM[lr]);
+                            bool p1_valid = plan.is_kv_valid[col1] && isfinite(p1) && isfinite(rM[lr]);
+                            rP[pb] = p0_valid ? exp2f(fminf(p0 - rM[lr], 0.0f)) : 0.0f;
+                            rP[pb+1] = p1_valid ? exp2f(fminf(p1 - rM[lr], 0.0f)) : 0.0f;
+                            if (p0_valid) cs += rP[pb];
+                            if (p1_valid) cs += rP[pb+1];
                         }
                     }
                     cs += __shfl_xor_sync(0xffffffff, cs, 1);
