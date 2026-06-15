@@ -215,7 +215,7 @@ def test_flash_mla(p: TestParam) -> Result:
             print(f'TFlops: {achieved_tflops:.1f}')
             print(f'GB/s: {achieved_gBps:.0f}')
             performance_result = Result(True, theoritical_compute_memory_ratio, e2e_time_usage_us, kernel_time_usages_us[splitkv_kernel_name] or 0.0, kernel_time_usages_us[combine_kernel_name] or 0.0, achieved_tflops, achieved_gBps)
-        except Exception:
+        except (RuntimeError, AssertionError, torch.cuda.OutOfMemoryError):
             performance_result = Result(True, 0.0, 1e6, 0.0, 0.0, 0.0, 0.0)
     
     is_correct = True

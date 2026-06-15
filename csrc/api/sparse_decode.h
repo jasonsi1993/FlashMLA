@@ -493,11 +493,6 @@ sparse_attn_decode_interface(
     params.stride_o_accum_s_q = int64_stride_to_int(o_accum.stride(1));
     params.stride_o_accum_h_q = int64_stride_to_int(o_accum.stride(2));
 
-    // Debug probe support: set debug buffer pointer if allocated
-    params.debug_buffer = sm120::decode::sparse_fp8::debug_get_ptr();
-    params.debug_indices = sm120::decode::sparse_fp8::debug_get_indices_ptr();
-    params.debug_probe_mask = sm120::decode::sparse_fp8::debug_is_enabled() ? 3 : 0;  // probes 1+2
-
     if (arch.is_sm120f()) {
         // Launch a single kernel with the full batch.
         if (model_type == ModelType::V32) {

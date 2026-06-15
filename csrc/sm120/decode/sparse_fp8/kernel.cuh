@@ -15,62 +15,6 @@ using fp8_e8m0 = __nv_fp8_e8m0;
 
 static constexpr float MAX_INIT_VAL = -1e30;
 
-// QK MMA: uses CuTe for correct register layout, manual asm for MMA instruction
-// Templated on the TiledMMA type to get correct per-warp partitioning
-template<typename TiledMMA>
-static __device__ __noinline__
-void qk_mma_kernel(bf16* sQ_ptr, bf16* sK_ptr, float* rP,
-                   int p_dim, int topk_blocks, int lane_id, int mm_row) {
-    ThrMMA thr = TiledMMA{}.get_slice(lane_id);
-
-    for (int ks = 0; ks < p_dim/16; ks++) {
-        // Q: [16 rows, K dims] at warp offset + ks*16
-        Tensor sQ = make_tensor(make_smem_ptr(sQ_ptr + mm_row * p_dim + ks * 16),
-            Layout<Shape<_16, _16>, Stride<_16, _1>>{});
-
-        // K: [64 tokens, K dims]
-        Tensor sK = make_tensor(make_smem_ptr(sK_ptr + ks * 16),
-            Layout<Shape<_64, _16>, Stride<_16, _1>>{});
-
-        // CuTe partition: per-thread smem views
-        Tensor tCsQ = thr.partition_A(sQ);
-        Tensor tCsK = thr.partition_B(sK);
-
-        // Load A from smem into registers via CuTe
-        Tensor tCrQ = thr.make_fragment_A(tCsQ);
-        cute::copy(tCsQ, tCrQ);
-        unsigned a_regs[4] = {0};
-        #pragma unroll
-        for (int i = 0; i < 4; i++)
-            a_regs[i] = reinterpret_cast<const unsigned&>(tCrQ(i, _0{}, _0{}));
-
-        for (int ns = 0; ns < topk_blocks/8; ns++) {
-            // B for this ns token group: [8 tokens, K dims]
-            Tensor sK_ns = make_tensor(make_smem_ptr(sK_ptr + ns * 8 * p_dim + ks * 16),
-                Layout<Shape<_8, _16>, Stride<_16, _1>>{});
-
-            Tensor tCsK_ns = thr.partition_B(sK_ns);
-            Tensor tCrK = thr.make_fragment_B(tCsK_ns);
-            cute::copy(tCsK_ns, tCrK);
-            unsigned b_regs[2] = {0};
-            #pragma unroll
-            for (int i = 0; i < 2; i++)
-                b_regs[i] = reinterpret_cast<const unsigned&>(tCrK(i, _0{}, _0{}));
-
-            float c[4] = {0, 0, 0, 0};
-            asm volatile(
-                "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                : "r"(a_regs[0]), "r"(a_regs[1]), "r"(a_regs[2]), "r"(a_regs[3]),
-                  "r"(b_regs[0]), "r"(b_regs[1]) : "memory");
-
-            int pb = ns * 4;
-            rP[pb] += c[0]; rP[pb+1] += c[1]; rP[pb+2] += c[2]; rP[pb+3] += c[3];
-        }
-    }
-}
-
 // Isolated PV MMA: takes only pointers it needs
 static __device__ __noinline__
 void pv_mma_kernel(float* sS_ptr, bf16* sV_ptr, float* rO,
