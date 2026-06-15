@@ -199,7 +199,7 @@ def main(torch_dtype):
     torch.cuda.set_device(device)
 
     cc_major, cc_minor = torch.cuda.get_device_capability()
-    assert cc_major == 9, "Dense MLA decoding is only supported on sm90 (Hopper) currently."
+    # SM120 also supported
 
     correctness_cases = [
         TestParam(b, s_q, s_k, is_varlen, is_causal, test_performance=False, have_zero_seqlen_k=False, block_size=64, h_q=h_q, h_kv=h_kv)

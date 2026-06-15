@@ -7,6 +7,7 @@
 #include "params.h"
 
 #include "sm90/decode/dense/splitkv_mla.h"
+#include "sm120/decode/dense/splitkv_mla.h"
 #include "smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
 #include "smxx/decode/combine/combine.h"
 
@@ -24,8 +25,8 @@ dense_attn_decode_interface(
 ) {
     // Check arch
     Arch arch = Arch();
-    if (!arch.is_sm90a()) {
-        TORCH_CHECK(false, "Dense decode MLA is only supported on SM90a architecture");
+    if (!arch.is_sm90a() && !arch.is_sm120f()) {
+        TORCH_CHECK(false, "Dense decode MLA is only supported on SM90a and SM120 architectures");
     }
 
     // Check data types
@@ -172,7 +173,59 @@ dense_attn_decode_interface(
 
     params.stream = at::cuda::getCurrentCUDAStream().stream();
 
-    if (q_dtype == torch::kBFloat16) {
+    if (arch.is_sm120f()) {
+        // SM120 dense decode kernel does not yet support causal masking.
+        TORCH_CHECK(!params.is_causal,
+            "SM120 dense decode does not support is_causal=True. "
+            "Use SM90 path or disable causal masking.");
+        // SM120: use WMMA-based dense decode kernel
+        sm120::DecodingParams sm120_params;
+        sm120_params.b = params.b;
+        sm120_params.h_k = params.h_k;
+        sm120_params.h_q = params.h_q;
+        sm120_params.q_head_per_hk = params.q_head_per_hk;
+        sm120_params.q_seq_per_hk = params.q_seq_per_hk;
+        sm120_params.s_q = params.s_q;
+        sm120_params.d = params.d;
+        sm120_params.d_v = params.d_v;
+        sm120_params.num_blocks = params.num_blocks;
+        sm120_params.q_ptr = params.q_ptr;
+        sm120_params.k_ptr = params.k_ptr;
+        sm120_params.o_ptr = params.o_ptr;
+        sm120_params.softmax_lse_ptr = params.softmax_lse_ptr;
+        sm120_params.seqlens_k_ptr = params.seqlens_k_ptr;
+        sm120_params.q_batch_stride = params.q_batch_stride;
+        sm120_params.q_row_stride = params.q_row_stride;
+        sm120_params.q_head_stride = params.q_head_stride;
+        sm120_params.k_batch_stride = params.k_batch_stride;
+        sm120_params.k_row_stride = params.k_row_stride;
+        sm120_params.k_head_stride = params.k_head_stride;
+        sm120_params.o_batch_stride = params.o_batch_stride;
+        sm120_params.o_row_stride = params.o_row_stride;
+        sm120_params.o_head_stride = params.o_head_stride;
+        sm120_params.block_table = params.block_table;
+        sm120_params.block_table_batch_stride = params.block_table_batch_stride;
+        sm120_params.page_block_size = params.page_block_size;
+        sm120_params.tile_scheduler_metadata_ptr = (int*)params.tile_scheduler_metadata_ptr;
+        sm120_params.num_sm_parts = params.num_sm_parts;
+        sm120_params.num_splits_ptr = params.num_splits_ptr;
+        sm120_params.total_num_splits = params.total_num_splits;
+        sm120_params.softmax_lseaccum_ptr = params.softmax_lseaccum_ptr;
+        sm120_params.oaccum_ptr = params.oaccum_ptr;
+        sm120_params.scale_softmax = params.scale_softmax;
+        sm120_params.scale_softmax_log2 = params.scale_softmax_log2;
+        sm120_params.is_causal = params.is_causal;
+        sm120_params.indices_ptr = nullptr;
+        sm120_params.indices_batch_stride = 0;
+        sm120_params.indices_row_stride = 0;
+        sm120_params.topk = 0;
+
+        if (q_dtype == torch::kBFloat16) {
+            sm120::run_flash_splitkv_mla_kernel_bf16(sm120_params, params.stream);
+        } else {
+            sm120::run_flash_splitkv_mla_kernel_fp16(sm120_params, params.stream);
+        }
+    } else if (q_dtype == torch::kBFloat16) {
         sm90::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t>(params);
     } else if (q_dtype == torch::kHalf) {
 #ifdef FLASH_MLA_DISABLE_FP16
@@ -184,42 +237,53 @@ dense_attn_decode_interface(
         TORCH_CHECK(false, "Unsupported dtype for dense MLA on SM90");
     }
 
-    CombineParams combine_params = {
-        batch_size, seqlen_q_ori,
-        num_heads_q, head_size_v,
+    if (!arch.is_sm120f()) {
+        // SM90/SM100: run combine kernel to merge split-KV partitions
+        CombineParams combine_params = {
+            batch_size, seqlen_q_ori,
+            num_heads_q, head_size_v,
 
-        params.softmax_lse_ptr,
-        params.o_ptr,
-        num_heads*q_seq_per_hk, num_heads_q,
-        num_heads_q*seqlen_q_ori*head_size_v, num_heads_q*head_size_v, head_size_v,
+            params.softmax_lse_ptr,
+            params.o_ptr,
+            num_heads*q_seq_per_hk, num_heads_q,
+            num_heads_q*seqlen_q_ori*head_size_v, num_heads_q*head_size_v, head_size_v,
 
-        params.softmax_lseaccum_ptr,
-        params.oaccum_ptr,
-        num_heads*q_seq_per_hk, num_heads_q,
-        num_heads_q*seqlen_q_ori*head_size_v, num_heads_q*head_size_v, head_size_v,
+            params.softmax_lseaccum_ptr,
+            params.oaccum_ptr,
+            num_heads*q_seq_per_hk, num_heads_q,
+            num_heads_q*seqlen_q_ori*head_size_v, num_heads_q*head_size_v, head_size_v,
 
-        params.tile_scheduler_metadata_ptr,
-        params.num_splits_ptr,
-        params.num_sm_parts,
+            params.tile_scheduler_metadata_ptr,
+            params.num_splits_ptr,
+            params.num_sm_parts,
 
-        nullptr,
-        at::cuda::getCurrentCUDAStream().stream()
-    };
+            nullptr,
+            at::cuda::getCurrentCUDAStream().stream()
+        };
 
-    if (q_dtype == torch::kBFloat16) {
-        smxx::decode::run_flash_mla_combine_kernel<cutlass::bfloat16_t>(combine_params);
-    } else if (q_dtype == torch::kHalf) {
-#ifndef FLASH_MLA_DISABLE_FP16
-        smxx::decode::run_flash_mla_combine_kernel<cutlass::half_t>(combine_params);
-#endif
+        if (q_dtype == torch::kBFloat16) {
+            smxx::decode::run_flash_mla_combine_kernel<cutlass::bfloat16_t>(combine_params);
+        } else if (q_dtype == torch::kHalf) {
+    #ifndef FLASH_MLA_DISABLE_FP16
+            smxx::decode::run_flash_mla_combine_kernel<cutlass::half_t>(combine_params);
+    #endif
+        } else {
+            TORCH_CHECK(false, "Unsupported tensor dtype for query");
+        }
+
+        out = out.view({batch_size, num_heads_k, seqlen_q_ori, num_q_heads_per_hk, head_size_v}).transpose(1, 2)
+                .reshape({batch_size, seqlen_q_ori, num_heads_q, head_size_v});
+        lse = lse.view({batch_size, num_heads_k, seqlen_q_ori, num_q_heads_per_hk}).transpose(2, 3)
+                .reshape({batch_size, num_heads_q, seqlen_q_ori});
     } else {
-        TORCH_CHECK(false, "Unsupported tensor dtype for query");
+        // SM120: kernel writes directly to output, no combine needed
+        // Output is already in [batch, num_heads_q, seqlen_q_ori, head_size_v] format?
+        // The kernel writes q_seq_per_hk rows per KV head; same reshape applies
+        out = out.view({batch_size, num_heads_k, seqlen_q_ori, num_q_heads_per_hk, head_size_v}).transpose(1, 2)
+                .reshape({batch_size, seqlen_q_ori, num_heads_q, head_size_v});
+        lse = lse.view({batch_size, num_heads_k, seqlen_q_ori, num_q_heads_per_hk}).transpose(2, 3)
+                .reshape({batch_size, num_heads_q, seqlen_q_ori});
     }
-
-    out = out.view({batch_size, num_heads_k, seqlen_q_ori, num_q_heads_per_hk, head_size_v}).transpose(1, 2)
-            .reshape({batch_size, seqlen_q_ori, num_heads_q, head_size_v});
-    lse = lse.view({batch_size, num_heads_k, seqlen_q_ori, num_q_heads_per_hk}).transpose(2, 3)
-            .reshape({batch_size, num_heads_q, seqlen_q_ori});
 
     return {out, lse, tile_scheduler_metadata, num_splits};
 }

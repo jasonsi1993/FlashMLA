@@ -8,6 +8,12 @@
 #include "defines.h"
 #include "params.h"
 
+// Unified SM120 mode flag: enabled when compiling for SM120 device arch
+// OR when building for host with SM120 support
+#if defined(KERUTILS_ENABLE_SM120) || defined(FLASH_MLA_HOST_HAS_SM120)
+#define FLASH_MLA_SM120_MODE 1
+#endif
+
 using namespace cute;
 
 namespace sm90::decode::sparse_fp8 {
@@ -31,7 +37,19 @@ static constexpr int NUM_SCALES = MODEL_TYPE == ModelType::V32 ? 4 : 8;  // For 
 static constexpr int NUM_THREADS = 128*3;
 static constexpr int BLOCK_M = 64;
 static constexpr int TOPK_BLOCK_SIZE = 64;
+#if defined(FLASH_MLA_SM120_MODE)
+// SM120 has only ~99KB shared memory (vs 227KB on SM90/SM100).
+// Split Q/K into passes of 5 tiles (320 dims) → 2 passes for both V32(9 tiles) and MODEL1(8 tiles).
+// Force no-split mode to use oBuf (64KB) instead of oAccumBuf (128KB).
+// Layout: struct{q(40KB), k(40KB)} = 80KB in union with oBuf(64KB). Total: 80+8+≈1=~89KB.
+static constexpr int NUM_K_BUFS = 1;
+static constexpr int QK_TILES_PER_PASS = 5;      // 5 tiles = 320 dims per pass
+static constexpr int NUM_QK_PASSES = (HEAD_DIM_K/64 + QK_TILES_PER_PASS - 1) / QK_TILES_PER_PASS;
+#else
 static constexpr int NUM_K_BUFS = 2;
+static constexpr int QK_TILES_PER_PASS = HEAD_DIM_K/64;  // All tiles in one pass
+static constexpr int NUM_QK_PASSES = 1;
+#endif
 
 using SmemLayoutQTile = decltype(tile_to_shape(
     GMMA::Layout_SW128_Atom<bf16, GMMA::Major::K>{},
@@ -46,6 +64,7 @@ using SmemLayoutQTiles = decltype(tile_to_shape(
 ));
 
 using SmemLayoutQ = SmemLayoutQTiles<HEAD_DIM_K/64>;
+using SmemLayoutQPass = SmemLayoutQTiles<QK_TILES_PER_PASS>;  // Smaller buffer for SM120 split passes
 
 using SmemLayoutKTile = decltype(tile_to_shape(
     GMMA::Layout_INTER_Atom<bf16, GMMA::Major::K>{},
@@ -62,8 +81,8 @@ using SmemLayoutKTiles = decltype(tile_to_shape(
 
 template<int NUM_TILES>
 using SmemLayoutKTilesTransposed = decltype(composition(
-	SmemLayoutKTiles<NUM_TILES>{},
-	Layout<Shape<Int<64*NUM_TILES>, Int<TOPK_BLOCK_SIZE>>, Stride<Int<TOPK_BLOCK_SIZE>, _1>>{}
+    SmemLayoutKTiles<NUM_TILES>{},
+    Layout<Shape<Int<64*NUM_TILES>, Int<TOPK_BLOCK_SIZE>>, Stride<Int<TOPK_BLOCK_SIZE>, _1>>{}
 ));
 
 static constexpr int OBUF_SW = 64;
@@ -76,10 +95,15 @@ using SmemLayoutOBuf = decltype(tile_to_shape(
 
 using SmemLayoutOAccumBuf = Layout<
     Shape<Int<BLOCK_M>, Int<HEAD_DIM_V>>,
-    Stride<Int<520>, _1>	// We use stride = 520 here to avoid bank conflict
+#ifdef FLASH_MLA_SM120_MODE
+    Stride<Int<512>, _1>   // SM120: use stride=512 to save shared memory
+#else
+    Stride<Int<520>, _1>   // We use stride = 520 here to avoid bank conflict
+#endif
 >;
 
 using SmemLayoutK = SmemLayoutKTiles<HEAD_DIM_K/64>;
+using SmemLayoutKPass = SmemLayoutKTiles<QK_TILES_PER_PASS>;  // Smaller K buffer for SM120 split passes
 using SmemLayoutV = SmemLayoutKTilesTransposed<HEAD_DIM_V/64>;
 using SmemLayoutHalfV = SmemLayoutKTilesTransposed<HEAD_DIM_V/64/2>;
 
@@ -89,17 +113,38 @@ using SmemLayoutS = decltype(tile_to_shape(
 ));
 
 struct SharedMemoryPlan {
+#ifdef FLASH_MLA_SM120_MODE
+    // SM120: Q and K in same union as oBuf. No oAccumBuf (forced no-split).
+    // Q (32KB) and K (32KB) are sequential in the anonymous struct (64KB total).
+    // V loads overwrite the Q/K struct region (V half = 32KB fits in either Q or K).
+    // oBuf (64KB) overlaps entire Q/K struct for final output.
+    // sizeof(union) = max(64KB, 64KB) = 64KB. Total ≈ 73KB (fits in 99KB).
+    union {
+        struct {
+            array_aligned<bf16, cosize_v<SmemLayoutQPass>> q;
+            array_aligned<bf16, cosize_v<SmemLayoutKPass>> k;
+        };
+        array_aligned<bf16, cosize_v<SmemLayoutOBuf>> oBuf;
+    };
+#else
     array_aligned<bf16, cosize_v<SmemLayoutQ>> q;
     union {
         array_aligned<bf16, cosize_v<SmemLayoutK>> k[NUM_K_BUFS];
         array_aligned<bf16, cosize_v<SmemLayoutOBuf>> oBuf;
         array_aligned<float, cosize_v<SmemLayoutOAccumBuf>> oAccumBuf;
     } u;
+#endif
     CUTE_ALIGNAS(1024) array_aligned<bf16, cosize_v<SmemLayoutS>> s;
     bool is_kv_valid[NUM_K_BUFS][TOPK_BLOCK_SIZE];
 
     float sM[BLOCK_M], sL[BLOCK_M], sScale[BLOCK_M], sOScale[BLOCK_M];
     transac_bar_t bar_q, bar_k_local_ready[NUM_K_BUFS], bar_k_remote_ready[NUM_K_BUFS], bar_k_avail[NUM_K_BUFS];
+#ifdef FLASH_MLA_SM120_MODE
+    // SM120 QK pass buffers are too small to serve as the PV V tile.  After QK
+    // completes, the producer reloads the full V tile into the contiguous q+k
+    // union and synchronizes that hand-off with these barriers.
+    transac_bar_t bar_qk_done[NUM_K_BUFS], bar_v_local_ready[NUM_K_BUFS], bar_v_remote_ready[NUM_K_BUFS];
+#endif
 };
 
 template<
@@ -112,11 +157,6 @@ struct TmaParams {
 
 using TiledMMA_QK = decltype(make_tiled_mma(
     GMMA::MMA_64x64x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::K>{},
-    Layout<Shape<_1, _1, _1>>{}
-));
-
-using TiledMMA_QK_rQ = decltype(make_tiled_mma(
-    GMMA::MMA_64x64x16_F32BF16BF16_RS<GMMA::Major::K, GMMA::Major::K>{},
     Layout<Shape<_1, _1, _1>>{}
 ));
 
@@ -181,8 +221,8 @@ template<
     typename Tensor3
 >
 static __forceinline__ __device__ void store_o(
-    Tensor0 &rO,	// ((2, 2, 32), 1, 1)
-    Tensor1 &gOorAccum,	// (BLOCK_SIZE_M, HEAD_DIM_V)
+    Tensor0 &rO,    // ((2, 2, 32), 1, 1)
+    Tensor1 &gOorAccum, // (BLOCK_SIZE_M, HEAD_DIM_V)
     Tensor2 &sOutputBuf,
     Tensor3 &sOutputAccumBuf,
     SharedMemoryPlan &plan,
@@ -231,12 +271,21 @@ static __forceinline__ __device__ void store_o(
         NamedBarrier::arrive_and_wait(256, NamedBarriers::epilogue_r2s_ready);
 
         if (threadIdx.x == 0) {
+#ifdef FLASH_MLA_SM120_MODE
+            SM90_TMA_STORE_5D::copy(
+                &tma_params.tensor_map_o,
+                plan.oBuf.data(),
+                0, head_block_idx*64, 0,
+                s_q_idx, batch_idx
+            );
+#else
             SM90_TMA_STORE_5D::copy(
                 &tma_params.tensor_map_o,
                 plan.u.oBuf.data(),
                 0, head_block_idx*64, 0,
                 s_q_idx, batch_idx
             );
+#endif
             cute::tma_store_arrive();
         }
     } else {
@@ -251,9 +300,9 @@ static __forceinline__ __device__ void store_o(
             };
         }
         cutlass::arch::fence_view_async_shared();
-        
+
         NamedBarrier::arrive_and_wait(256, NamedBarriers::epilogue_r2s_ready);
-        
+
         if (elect_one_sync()) {
             CUTLASS_PRAGMA_UNROLL
             for (int local_row = 0; local_row < BLOCK_M / (256/32); ++local_row) {
